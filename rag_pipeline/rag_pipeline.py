@@ -37,7 +37,8 @@ class Args:
                  top_k_semantic=None, top_k_keyword=None, top_k_hybrid=None, top_k_rerank=None,
                  dataset_name_huggingface=None, question_type_retrieval_config=None,
                  default_rag_config=None,
-                 fast_triage_confidence_threshold=None, enforce_modality_separation=None):
+                 fast_triage_confidence_threshold=None, enforce_modality_separation=None,
+                 model_name=None):
         """
         Initialize arguments with options for dataset and model type.
         
@@ -85,17 +86,18 @@ class Args:
             self.dataset_name = "test"
             self.dataset_path = dataset_path or os.path.join(self.output_dir, "test_dataset.csv")
             self.images_dir = images_dir or os.path.join(self.base_dir, "2025_dataset", "test", "images_test")
-            self.prediction_prefix = "aggregated_test_predictions_"
+            self.prediction_prefix = "test_aggregated_predictions_"
         else:
             self.dataset_name = "validation"
             self.dataset_path = dataset_path or os.path.join(self.output_dir, "val_dataset.csv")
             self.images_dir = images_dir or os.path.join(self.base_dir, "2025_dataset", "valid", "images_valid")
-            self.prediction_prefix = "aggregated_predictions_"
+            self.prediction_prefix = "val_aggregated_predictions_"
         
+        self.model_name = model_name
         self.model_type = "finetuned" if self.use_finetuning else "base"
         
         # Model and processing configuration
-        self.gemini_model = gemini_model or "gemini-2.5-flash-preview-04-17"
+        self.gemini_model = gemini_model or "gemini-2.0-flash"
         self.max_reflection_cycles = max_reflection_cycles or 2
         self.confidence_threshold = confidence_threshold or 0.75
         
@@ -165,7 +167,8 @@ class DataLoader:
     @staticmethod
     def get_latest_aggregated_files(args):
         """Get the latest aggregated prediction files for each model."""
-        pattern = os.path.join(args.model_predictions_dir, f"{args.prediction_prefix}*_{args.model_type}_*.csv")
+        # Use a more flexible pattern that matches the pipeline.py output format
+        pattern = os.path.join(args.model_predictions_dir, f"{args.prediction_prefix}*.csv")
         
         agg_files = glob.glob(pattern)
         
@@ -177,20 +180,26 @@ class DataLoader:
         for file_path in agg_files:
             file_name = os.path.basename(file_path)
             
-            parts = file_name.split(f"_{args.model_type}_")
+            model_part = file_name.replace(args.prediction_prefix, "").replace(".csv", "")
+            
+            # The model name is everything before the timestamp
+            # Format: {prefix}{model_name}_{timestamp}.csv
+            parts = model_part.rsplit('_', 1)
             if len(parts) != 2:
-                print(f"Warning: Unexpected filename format: {file_name}")
+                print(f"Warning: Unexpected filename format (no timestamp?): {file_name}")
                 continue
             
-            model_part = parts[0].replace(args.prediction_prefix, "")
-            model_name = model_part
+            model_name = parts[0]
             
-            timestamps = re.findall(r'(\d+)', parts[1])
-            if len(timestamps) < 2:
-                print(f"Warning: Could not find timestamps in {file_name}")
+            # Filter by model_name if provided
+            if args.model_name and model_name != args.model_name:
                 continue
-            
-            timestamp = int(timestamps[1])
+
+            try:
+                timestamp = int(parts[1])
+            except ValueError:
+                print(f"Warning: Could not parse timestamp in {file_name}")
+                continue
             
             if model_name not in latest_files or timestamp > latest_files[model_name]['timestamp']:
                 latest_files[model_name] = {
@@ -214,12 +223,8 @@ class DataLoader:
         for file_path in latest_files:
             file_name = os.path.basename(file_path)
             
-            parts = file_name.split(f"_{args.model_type}_")
-            if len(parts) != 2:
-                print(f"Warning: Unexpected filename format: {file_name}")
-                continue
-                
-            model_name = parts[0].replace(args.prediction_prefix, "")
+            model_part = file_name.replace(args.prediction_prefix, "").replace(".csv", "")
+            model_name = model_part.rsplit('_', 1)[0]
             
             try:
                 df = pd.read_csv(file_path)
@@ -1037,6 +1042,63 @@ class AgenticDermatologyPipeline:
             args
         )
     
+    def _call_gemini_with_retry(self, model, contents, config=None, max_retries=5):
+        """Call Gemini API with fallback for 404s and retry for 429s."""
+        import time as _time
+        import random as _random
+
+        # --- Resilience Upgrade ---
+        PRIMARY_MODEL = model
+        FALLBACK_MODEL = "gemini-2.5-flash"  # Synced with discovery list
+        
+        current_model = PRIMARY_MODEL
+        base_delay = 5          # Reduced base delay for paid tier
+        
+        for attempt in range(max_retries + 1):
+            try:
+                kwargs = {"model": current_model, "contents": contents}
+                if config:
+                    kwargs["config"] = config
+                response = self.client.models.generate_content(**kwargs)
+                return response
+
+            except Exception as exc:
+                error_str = str(exc).lower()
+                
+                # Handle 404: Try fallback model immediately
+                if "404" in error_str or "not_found" in error_str:
+                    if current_model != FALLBACK_MODEL:
+                        print(f"  [Resilience] 404 on '{current_model}'. Trying fallback '{FALLBACK_MODEL}'...")
+                        current_model = FALLBACK_MODEL
+                        # Retry immediately in the next iteration
+                        continue 
+                    else:
+                        raise exc
+
+                is_rate_limit = (
+                    "429" in error_str
+                    or "resource_exhausted" in error_str
+                    or "quota" in error_str
+                    or "rate limit" in error_str
+                )
+                if is_rate_limit and attempt < max_retries:
+                    # Exponential backoff with ±10 % jitter
+                    delay = base_delay * (2 ** attempt) * (1 + _random.uniform(-0.1, 0.1))
+                    print(
+                        f"  [Rate Limit] 429/RESOURCE_EXHAUSTED on attempt "
+                        f"{attempt + 1}/{max_retries}. "
+                        f"Backing off {delay:.1f} s before retry..."
+                    )
+                    _time.sleep(delay)
+                else:
+                    # Non-rate-limit error, or retries exhausted → propagate
+                    if attempt >= max_retries:
+                        print(
+                            f"  [Gemini] All {max_retries} retries exhausted. "
+                            f"Last error: {exc}"
+                        )
+                    raise exc
+    
     def fast_triage(self, patient_description: str, images: List[str], query_context: str) -> Dict[str, Any]:
         """
         Phase 1 — Fast Triage Gatekeeper (Gap 1).
@@ -1094,8 +1156,8 @@ Respond strictly in JSON format:
 
             contents = [prompt] + image_parts if image_parts else [prompt]
 
-            response = self.client.models.generate_content(
-                model=self.args.gemini_model if self.args else "gemini-2.5-flash-preview-04-17",
+            response = self._call_gemini_with_retry(
+                model=self.args.gemini_model if self.args else "gemini-2.0-flash",
                 contents=contents
             )
 
@@ -1197,8 +1259,8 @@ Respond strictly in JSON format:
             if not image_parts:
                 return {"error": "No valid image files found at provided paths"}
 
-            response = self.client.models.generate_content(
-                model=self.args.gemini_model if self.args else "gemini-2.5-flash-preview-04-17",
+            response = self._call_gemini_with_retry(
+                model=self.args.gemini_model if self.args else "gemini-2.0-flash",
                 contents=[prompt] + image_parts
             )
 
@@ -2252,7 +2314,8 @@ class RAGConfig:
     # Model and dataset configuration
     use_finetuning: bool = True
     use_test_dataset: bool = True
-    gemini_model: str = "gemini-2.5-flash-preview-04-17"
+    model_name: Optional[str] = None
+    gemini_model: str = "gemini-2.0-flash"
     
     # Directory paths
     base_dir: Optional[str] = None
@@ -2340,7 +2403,8 @@ class RAGConfig:
             question_type_retrieval_config=self.question_type_retrieval_config,
             default_rag_config=self.default_rag_config,
             fast_triage_confidence_threshold=self.fast_triage_confidence_threshold,
-            enforce_modality_separation=self.enforce_modality_separation
+            enforce_modality_separation=self.enforce_modality_separation,
+            model_name=self.model_name
         )
         
         return args
@@ -2380,12 +2444,38 @@ class RAGPipeline:
             api_key=self.config.api_key,
             args=self.args
         )
-        
-        # Load data
-        model_predictions_dict = DataLoader.load_all_model_predictions(self.args)
-        
-        if not model_predictions_dict:
-            raise ValueError("No model predictions found. Please check your configuration.")
+        # --- SURGICAL OVERRIDE START ---
+        # Loads Qwen2-VL-2B-Instruct CSV predictions directly by glob-matching
+        # the output directory, so the pipeline does not depend on DataLoader's
+        # filename-timestamp parser.  Update MODEL_NAME below if you switch models.
+        import pandas as pd
+        import glob as _glob
+
+        _MODEL_NAME   = "Qwen2-VL-2B-Instruct"
+        _outputs_dir  = self.args.output_dir          # e.g. .../outputs/
+
+        if self.args.use_test_dataset:
+            _pattern = os.path.join(_outputs_dir, f"test_aggregated_predictions_{_MODEL_NAME}_*.csv")
+            _label   = "test"
+        else:
+            _pattern = os.path.join(_outputs_dir, f"val_aggregated_predictions_{_MODEL_NAME}_*.csv")
+            _label   = "validation"
+
+        _matches = sorted(_glob.glob(_pattern))
+        if not _matches:
+            raise FileNotFoundError(
+                f"[Surgical Override] No CSV found matching: {_pattern}\n"
+                f"Run step4_validate.py first to generate the aggregated predictions file."
+            )
+
+        _csv_path = _matches[-1]   # pick the most-recently-written file
+        print(f"[Surgical Override] Loading {_label} predictions from:\n  {_csv_path}")
+
+        df = pd.read_csv(_csv_path)
+        df["model_name"] = _MODEL_NAME          # inject the key DataLoader expects
+        model_predictions_dict = {_label: df}
+        print(f"[Surgical Override] Loaded {len(df)} rows for model '{_MODEL_NAME}'.")
+        # --- SURGICAL OVERRIDE END ---
             
         all_models_df = self._concat_model_predictions(model_predictions_dict)
         dataset_df = DataLoader.load_validation_dataset(self.args)
@@ -2420,10 +2510,13 @@ class RAGPipeline:
             
         return encounter_results
         
-    def process_all_encounters(self) -> Tuple[Dict[str, Any], List[Dict[str, Any]]]:
+    def process_all_encounters(self, num_samples: Optional[int] = None) -> Tuple[Dict[str, Any], List[Dict[str, Any]]]:
         """
         Process all available encounters with RAG analysis.
         
+        Args:
+            num_samples: Optional limit on the number of encounters to process.
+            
         Returns:
             Tuple of (complete_results, formatted_predictions)
         """
@@ -2432,6 +2525,10 @@ class RAGPipeline:
             
         all_pairs = self.agentic_data.get_all_encounter_question_pairs()
         unique_encounter_ids = sorted(list(set(pair[0] for pair in all_pairs)))
+        
+        if num_samples is not None:
+            unique_encounter_ids = unique_encounter_ids[:num_samples]
+            print(f"Limiting to first {num_samples} encounters for pilot validation.")
         
         print(f"Found {len(unique_encounter_ids)} unique encounters to process")
         

@@ -33,3 +33,5 @@ archives/
 nltk_data/
 
 knowledge_db/
+
+.venv_gpu/

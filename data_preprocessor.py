@@ -7,6 +7,7 @@ import os
 import gc
 import re
 import ast
+import sys
 import json
 import shutil
 import random
@@ -116,23 +117,127 @@ class DataPreprocessor:
         else:
             raise ValueError("Mode must be either 'train', 'val', or 'test'")
         
+        # ── DEBUG: verify all source paths exist before opening ──────────────
+        for label, p in [("QUESTIONS_PATH", self.config.QUESTIONS_PATH),
+                         (f"{mode.upper()}_JSON_PATH", json_path),
+                         (f"{mode.upper()}_CVQA_PATH", cvqa_path),
+                         (f"{mode.upper()}_IMAGES_DIR", images_dir)]:
+            exists = os.path.exists(p)
+            print(f"DEBUG: [{label}] {'✓ found' if exists else '✗ MISSING'} → {p}")
+            if not exists:
+                print(f"CRITICAL ERROR: Required path not found: {p}")
+                sys.exit(1)
+        # ─────────────────────────────────────────────────────────────────────
+
         # Load questions definitions
-        with open(self.config.QUESTIONS_PATH, 'r') as f:
-            questions = json.load(f)
+        print(f"DEBUG: Loading questions from: {self.config.QUESTIONS_PATH}")
+        try:
+            with open(self.config.QUESTIONS_PATH, 'r', encoding='utf-8') as f:
+                questions = json.load(f)
+            print(f"DEBUG: Loaded {len(questions)} question definitions")
+        except Exception as e:
+            print(f"CRITICAL ERROR loading questions JSON: {e}")
+            traceback.print_exc()
+            sys.exit(1)
             
-        questions_df = pd.json_normalize(questions)[
-            ["qid", "question_en", "options_en", "question_type_en", "question_category_en"]
-        ]
+        # --- MANUAL SAFE QUESTIONS DATAFRAME BLOCK ---
+        try:
+            print("DEBUG: Starting manual questions DataFrame creation...")
+            
+            # Force garbage collection before heavy processing
+            gc.collect()
+            print("DEBUG: 1")
+            manual_questions_list = []
+            print("DEBUG: 2")
+    
+            for item in questions:
+                if not isinstance(item, dict):
+                    print(f"WARNING: Skipping non-dict question item: {type(item)}")
+                    continue
+                print("DEBUG: 3")
+
+                manual_questions_list.append({
+                    "qid": item.get("qid"),
+                    "question_en": item.get("question_en"),
+                    "options_en": item.get("options_en"),
+                    "question_type_en": item.get("question_type_en"),
+                    "question_category_en": item.get("question_category_en")
+                })
+
+            questions_df = pd.DataFrame(manual_questions_list)
+
+            # Ensure required columns exist even if missing in source JSON
+            required_cols = [
+                "qid",
+                "question_en",
+                "options_en",
+                "question_type_en",
+                "question_category_en"
+            ]
+
+            for col in required_cols:
+                if col not in questions_df.columns:
+                    print(f"WARNING: Missing column '{col}' added with None values")
+                    questions_df[col] = None
+
+            # Keep only required columns in fixed order
+            questions_df = questions_df[required_cols]
+
+            # Optional cleanup
+            del manual_questions_list
+            gc.collect()
+
+            print(f"DEBUG: Manual DataFrame creation successful with {len(questions_df)} rows")
+
+        except Exception as e:
+            print(f"CRITICAL ERROR during manual questions DataFrame creation: {e}")
+            traceback.print_exc()
+            sys.exit(1)
+        # ------------------------------------------------
         
         # Load input data
-        input_df = pd.read_json(json_path)
-        query_info_df = input_df[
-            ["encounter_id", "image_ids", "query_title_en", "query_content_en", "author_id"]
-        ]
+        print(f"DEBUG: Loading input JSON from: {json_path}")
+        try:
+            input_df = pd.read_json(json_path)
+            print(f"DEBUG: Loaded input_df with {len(input_df)} rows, columns: {list(input_df.columns)}")
+        except Exception as e:
+            print(f"CRITICAL ERROR loading input JSON ({json_path}): {e}")
+            traceback.print_exc()
+            sys.exit(1)
+
+        # Guard: ensure required columns exist
+        required_input_cols = ["encounter_id", "image_ids", "query_title_en", "query_content_en", "author_id"]
+        missing_cols = [c for c in required_input_cols if c not in input_df.columns]
+        if missing_cols:
+            print(f"CRITICAL ERROR: input JSON is missing columns: {missing_cols}")
+            print(f"  Available columns: {list(input_df.columns)}")
+            sys.exit(1)
+
+        query_info_df = input_df[required_input_cols]
+
+        # ── DEBUG: spot-check first image path ───────────────────────────────
+        first_image_ids = input_df.iloc[0].get("image_ids", [])
+        if first_image_ids:
+            first_img_id = first_image_ids[0] if isinstance(first_image_ids, list) else first_image_ids
+            first_img_path = os.path.join(images_dir, first_img_id)
+            print(f"DEBUG: Checking first image path: {first_img_path}")
+            if os.path.exists(first_img_path):
+                print(f"DEBUG: ✓ First image found")
+            else:
+                print(f"WARNING: First image NOT found at {first_img_path}")
+                print(f"  Hint: Check that images_dir is correct and uses forward slashes.")
+        # ─────────────────────────────────────────────────────────────────────
         
         # Load CVQA data
-        with open(cvqa_path, 'r') as f:
-            cvqa_data = json.load(f)
+        print(f"DEBUG: Loading CVQA data from: {cvqa_path}")
+        try:
+            with open(cvqa_path, 'r', encoding='utf-8') as f:
+                cvqa_data = json.load(f)
+            print(f"DEBUG: Loaded {len(cvqa_data)} CVQA records")
+        except Exception as e:
+            print(f"CRITICAL ERROR loading CVQA JSON ({cvqa_path}): {e}")
+            traceback.print_exc()
+            sys.exit(1)
         cvqa_df = pd.json_normalize(cvqa_data)
         
         # Reshape CVQA data
@@ -200,6 +305,13 @@ class DataPreprocessor:
             lambda row: pd.Series(get_valid_answers(row)), axis=1
         )
         
+        # ── DEBUG: guard empty merge result ──────────────────────────────────
+        print(f"DEBUG: grouped_by_family has {len(grouped_by_family)} rows after merge+groupby")
+        if grouped_by_family.empty:
+            print("CRITICAL ERROR: grouped_by_family is empty — check encounter_id alignment between input JSON and CVQA data.")
+            sys.exit(1)
+        # ─────────────────────────────────────────────────────────────────────
+
         # Create dataset rows
         dataset_rows = []
         
@@ -242,7 +354,18 @@ class DataPreprocessor:
                 })
         
         dataset = pd.DataFrame(dataset_rows)
-        dataset.to_csv(os.path.join(self.config.OUTPUT_DIR, output_filename), index=False)
+
+        # ── DEBUG: guard empty output ─────────────────────────────────────────
+        if dataset.empty:
+            print(f"WARNING: {mode} dataset is empty — no rows were created.")
+            print("  Possible causes: all images missing, merge produced no matches, or image_ids list is empty.")
+        else:
+            print(f"DEBUG: {mode} dataset has {len(dataset)} rows, columns: {list(dataset.columns)}")
+        # ─────────────────────────────────────────────────────────────────────
+
+        output_path = os.path.join(self.config.OUTPUT_DIR, output_filename)
+        print(f"DEBUG: Saving {mode} CSV to: {output_path}")
+        dataset.to_csv(output_path, index=False)
         
         print(f"{mode.capitalize()} dataset created with {len(dataset)} entries")
         return dataset
@@ -258,16 +381,83 @@ class DataPreprocessor:
         images_dir = self.config.TEST_IMAGES_DIR
         output_filename = "test_dataset.csv"
         
+        # ── DEBUG: verify source paths ────────────────────────────────────────
+        for label, p in [("TEST_JSON_PATH", json_path),
+                         ("TEST_IMAGES_DIR", images_dir),
+                         ("QUESTIONS_PATH", self.config.QUESTIONS_PATH)]:
+            exists = os.path.exists(p)
+            print(f"DEBUG: [{label}] {'✓ found' if exists else '✗ MISSING'} → {p}")
+            if not exists:
+                print(f"CRITICAL ERROR: Required path not found: {p}")
+                sys.exit(1)
+        # ─────────────────────────────────────────────────────────────────────
+
         # Load questions definitions
-        with open(self.config.QUESTIONS_PATH, 'r') as f:
-            questions = json.load(f)
+        print(f"DEBUG: Loading questions from: {self.config.QUESTIONS_PATH}")
+        try:
+            with open(self.config.QUESTIONS_PATH, 'r', encoding='utf-8') as f:
+                questions = json.load(f)
+            print(f"DEBUG: Loaded {len(questions)} question definitions")
+        except Exception as e:
+            print(f"CRITICAL ERROR loading questions JSON: {e}")
+            traceback.print_exc()
+            sys.exit(1)
             
-        questions_df = pd.json_normalize(questions)[
-            ["qid", "question_en", "options_en", "question_type_en", "question_category_en"]
-        ]
+        try:
+            print("DEBUG: Starting manual test questions DataFrame creation...")
+            
+            gc.collect()
+
+            manual_questions_list = []
+
+            for item in questions:
+                if not isinstance(item, dict):
+                    print(f"WARNING: Skipping non-dict question item: {type(item)}")
+                    continue
+
+                manual_questions_list.append({
+                    "qid": item.get("qid"),
+                    "question_en": item.get("question_en"),
+                    "options_en": item.get("options_en"),
+                    "question_type_en": item.get("question_type_en"),
+                    "question_category_en": item.get("question_category_en")
+                })
+
+            questions_df = pd.DataFrame(manual_questions_list)
+
+            required_cols = [
+                "qid",
+                "question_en",
+                "options_en",
+                "question_type_en",
+                "question_category_en"
+            ]
+
+            for col in required_cols:
+                if col not in questions_df.columns:
+                    questions_df[col] = None
+
+            questions_df = questions_df[required_cols]
+
+            del manual_questions_list
+            gc.collect()
+
+            print(f"DEBUG: Manual DataFrame creation successful with {len(questions_df)} rows")
+
+        except Exception as e:
+            print(f"CRITICAL ERROR during manual test questions DataFrame creation: {e}")
+            traceback.print_exc()
+            sys.exit(1)
         
         # Load input data
-        input_df = pd.read_json(json_path)
+        print(f"DEBUG: Loading test input JSON from: {json_path}")
+        try:
+            input_df = pd.read_json(json_path)
+            print(f"DEBUG: Loaded test input_df with {len(input_df)} rows")
+        except Exception as e:
+            print(f"CRITICAL ERROR loading test JSON ({json_path}): {e}")
+            traceback.print_exc()
+            sys.exit(1)
         query_info_df = input_df[
             ["encounter_id", "image_ids", "query_title_en", "query_content_en", "author_id"]
         ]
@@ -335,7 +525,18 @@ class DataPreprocessor:
                         })
         
         dataset = pd.DataFrame(dataset_rows)
-        dataset.to_csv(os.path.join(self.config.OUTPUT_DIR, output_filename), index=False)
+
+        # ── DEBUG: guard empty test output ────────────────────────────────────
+        if dataset.empty:
+            print("WARNING: test dataset is empty — no rows were created.")
+            print("  Check that image files exist under TEST_IMAGES_DIR and encounter_ids are valid.")
+        else:
+            print(f"DEBUG: test dataset has {len(dataset)} rows")
+        # ─────────────────────────────────────────────────────────────────────
+
+        output_path = os.path.join(self.config.OUTPUT_DIR, output_filename)
+        print(f"DEBUG: Saving test CSV to: {output_path}")
+        dataset.to_csv(output_path, index=False)
         
         print(f"Test dataset created with {len(dataset)} entries")
         return dataset
@@ -366,9 +567,10 @@ class DataPreprocessor:
             try:
                 image_id = row.get('image_id')
                 if not image_id:
+                    print(f"DEBUG: Skipping row {idx} — empty image_id")
                     continue
                     
-                if 'image_path' in row and os.path.exists(row['image_path']):
+                if 'image_path' in row and pd.notna(row['image_path']) and os.path.exists(row['image_path']):
                     image_path = row['image_path']
                 else:
                     image_path = os.path.join(images_dir, image_id)
@@ -381,6 +583,9 @@ class DataPreprocessor:
                 try:
                     with Image.open(image_path) as img:
                         img.load()
+                        # ── DEBUG: warn on unusual image modes ────────────────
+                        if img.mode not in ("RGB", "L", "RGBA"):
+                            print(f"DEBUG: Unusual image mode '{img.mode}' for {image_path} — converting to RGB")
                 except Exception as e:
                     print(f"Corrupt or unreadable image at {image_path} — {e}")
                     continue
@@ -498,8 +703,14 @@ class DataPreprocessor:
         
         # Save batch file
         batch_file = os.path.join(save_dir, f"{file_prefix}{batch_idx}.pkl")
-        with open(batch_file, 'wb') as f:
-            pickle.dump(batch_data, f)
+        print(f"DEBUG: Saving batch {batch_idx} → {batch_file} ({len(batch_data)} items)")
+        try:
+            with open(batch_file, 'wb') as f:
+                pickle.dump(batch_data, f)
+        except Exception as e:
+            print(f"CRITICAL ERROR: Failed to write batch file {batch_file}: {e}")
+            traceback.print_exc()
+            raise
         
         return len(batch_data)
     
@@ -540,7 +751,18 @@ class DataPreprocessor:
                 images_dir = self.config.VAL_IMAGES_DIR
         
         os.makedirs(save_dir, exist_ok=True)
-        
+
+        # ── DEBUG: sanity check before batch loop ────────────────────────────
+        print(f"DEBUG: preprocess_dataset — mode={mode}, rows={len(df)}, "
+              f"batch_size={batch_size}, save_dir={save_dir}")
+        if df.empty:
+            print("WARNING: DataFrame passed to preprocess_dataset is empty — nothing to process.")
+            return 0
+        if not os.path.isdir(images_dir):
+            print(f"CRITICAL ERROR: images_dir does not exist: {images_dir}")
+            sys.exit(1)
+        # ─────────────────────────────────────────────────────────────────────
+
         for i in range(0, len(df), batch_size):
             batch_df = df.iloc[i:i+batch_size]
             batch_idx = i // batch_size
@@ -556,94 +778,105 @@ class DataPreprocessor:
     
     def prepare_and_process_datasets(self, skip_data_prep=False, use_combined_dataset=False, test_mode=False, min_data_size=10):
         """
-        Prepare and process datasets based on arguments.
-        
-        Args:
-            skip_data_prep: Whether to skip data preparation
-            use_combined_dataset: Whether to combine train and val datasets
-            test_mode: Whether to run in test mode with small dataset
-            min_data_size: Minimum data size for test mode
-            
-        Returns:
-            Tuple containing (train_df, val_df)
+        Prepare and process datasets based on arguments with enhanced debugging.
         """
+        print("\n" + "="*50)
+        print(f"DEBUG: Starting data preparation pipeline")
+        print(f"DEBUG: skip_data_prep={skip_data_prep}, use_combined={use_combined_dataset}, test_mode={test_mode}")
+        print("="*50)
+        
         train_df = None
         val_df = None
         
         # Check if batch files already exist
         batch_files_exist = self._check_batch_files_exist(use_combined_dataset)
+        print(f"DEBUG: Batch files exist on disk: {batch_files_exist}")
         
         if skip_data_prep and batch_files_exist:
-            print("Skipping data preparation - batch files already exist...")
+            print(">>> Skipping data preparation - loading existing CSVs...")
             
-            if os.path.exists(os.path.join(self.config.OUTPUT_DIR, "train_dataset_processed.csv")):
-                train_df = pd.read_csv(os.path.join(self.config.OUTPUT_DIR, "train_dataset_processed.csv"))
-                print(f"Loaded existing training dataset with {len(train_df)} samples")
-            
-            if os.path.exists(os.path.join(self.config.OUTPUT_DIR, "val_dataset.csv")):
-                val_df = pd.read_csv(os.path.join(self.config.OUTPUT_DIR, "val_dataset.csv"))
-                print(f"Loaded existing validation dataset with {len(val_df)} samples")
+            try:
+                train_path = os.path.join(self.config.OUTPUT_DIR, "train_dataset_processed.csv")
+                if os.path.exists(train_path):
+                    train_df = pd.read_csv(train_path)
+                    print(f"DEBUG: Loaded {len(train_df)} rows from {train_path}")
+                
+                val_path = os.path.join(self.config.OUTPUT_DIR, "val_dataset.csv")
+                if os.path.exists(val_path):
+                    val_df = pd.read_csv(val_path)
+                    print(f"DEBUG: Loaded {len(val_df)} rows from {val_path}")
+            except Exception as e:
+                print(f"DEBUG: Error loading existing CSVs: {str(e)}")
         
         else:
+            print(">>> Data preparation required. Starting fresh processing...")
             if use_combined_dataset:
-                print("Creating combined train+val dataset...")
-                
+                print("DEBUG: Logic - Combined Dataset Path")
                 print("Preparing training dataset...")
                 train_df = self.prepare_dataset(mode="train")
-                
                 print("Preparing validation dataset...")
                 val_df = self.prepare_dataset(mode="val")
-            
+                
+                print("DEBUG: Concatenating DataFrames...")
                 train_df = pd.concat([train_df, val_df], ignore_index=True)
                 val_df = None
                 
                 combined_file = os.path.join(self.config.OUTPUT_DIR, "combined_train_val_dataset.csv")
                 train_df.to_csv(combined_file, index=False)
-                print(f"Combined dataset saved to {combined_file} with {len(train_df)} samples")
-                            
+                print(f"DEBUG: Combined CSV saved: {len(train_df)} samples")
             else: 
+                print("DEBUG: Logic - Separate Dataset Path")
                 print("Preparing training dataset...")
                 train_df = self.prepare_dataset(mode="train")
-                
                 print("Preparing validation dataset...")
                 val_df = self.prepare_dataset(mode="val")
             
+            # Apply Test Mode truncation
             if test_mode:
-                print("Running in test mode with a small subset of data...")
-                
+                print(f">>> TEST_MODE ACTIVE: Truncating to max {min_data_size} samples")
                 if train_df is not None:
-                    test_size = min(min_data_size, len(train_df))
-                    train_df = train_df.head(test_size)
-                    print(f"Using {len(train_df)} training samples for testing")
-                
+                    train_df = train_df.head(min(min_data_size, len(train_df)))
+                    print(f"DEBUG: Train subset size: {len(train_df)}")
                 if val_df is not None:
-                    test_size = min(min_data_size, len(val_df))
-                    val_df = val_df.head(test_size)
-                    print(f"Using {len(val_df)} validation samples for testing")
+                    val_df = val_df.head(min(min_data_size, len(val_df)))
+                    print(f"DEBUG: Val subset size: {len(val_df)}")
             
-            # Clean up existing processed directories
+            # Directory Management with Windows-Safe Error Handling
+            def safe_recreate_dir(directory):
+                print(f"DEBUG: Recreating directory: {directory}")
+                try:
+                    if os.path.exists(directory):
+                        # ignore_errors=True is safer on Windows if files are locked
+                        shutil.rmtree(directory, ignore_errors=True)
+                    os.makedirs(directory, exist_ok=True)
+                except Exception as e:
+                    print(f"CRITICAL DEBUG: Failed to recreate {directory}. Error: {e}")
+                    raise e
+
             if use_combined_dataset:
-                if os.path.exists(self.config.PROCESSED_COMBINED_DATA_DIR):
-                    shutil.rmtree(self.config.PROCESSED_COMBINED_DATA_DIR)
-                os.makedirs(self.config.PROCESSED_COMBINED_DATA_DIR, exist_ok=True)
+                safe_recreate_dir(self.config.PROCESSED_COMBINED_DATA_DIR)
             else:
-                if os.path.exists(self.config.PROCESSED_TRAIN_DATA_DIR):
-                    shutil.rmtree(self.config.PROCESSED_TRAIN_DATA_DIR)
-                os.makedirs(self.config.PROCESSED_TRAIN_DATA_DIR, exist_ok=True)
+                safe_recreate_dir(self.config.PROCESSED_TRAIN_DATA_DIR)
+                safe_recreate_dir(self.config.PROCESSED_VAL_DATA_DIR)
             
-                if os.path.exists(self.config.PROCESSED_VAL_DATA_DIR):
-                    shutil.rmtree(self.config.PROCESSED_VAL_DATA_DIR)
-                os.makedirs(self.config.PROCESSED_VAL_DATA_DIR, exist_ok=True)
-            
-            # Process datasets into batch files
-            print("Processing datasets into batch files...")
-            self.process_all_datasets(
-                train_df=train_df,
-                val_df=val_df,
-                use_combined_dataset=use_combined_dataset,
-                batch_size=100
-            )
+            # Final processing step
+            print(">>> Starting batch serialization to .pkl files...")
+            try:
+                self.process_all_datasets(
+                    train_df=train_df,
+                    val_df=val_df,
+                    use_combined_dataset=use_combined_dataset,
+                    batch_size=100
+                )
+                print("DEBUG: process_all_datasets completed successfully.")
+            except Exception as e:
+                print(f"CRITICAL DEBUG: Crash inside process_all_datasets: {str(e)}")
+                import traceback
+                traceback.print_exc()
+                raise e
         
+        print(f"DEBUG: Data preparation finished. Returning {len(train_df) if train_df is not None else 0} train rows.")
+        print("="*50 + "\n")
         return train_df, val_df
     
     def process_all_datasets(self, train_df=None, val_df=None, use_combined_dataset=False, batch_size=100):
@@ -968,7 +1201,7 @@ class DataPreprocessor:
         
         # Save analysis results
         output_path = os.path.join(self.config.OUTPUT_DIR, f"{os.path.basename(dataset_dir)}_token_analysis.json")
-        with open(output_path, "w") as f:
+        with open(output_path, "w", encoding='utf-8') as f:
             json.dump(token_stats, f, indent=2)
         
         print("\nToken Usage Analysis:")

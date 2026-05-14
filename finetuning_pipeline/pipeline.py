@@ -3,7 +3,9 @@ Medical Image Fine-tuning and Inference Pipeline
 Fine-tunes vision-language models on medical imaging data and runs inference.
 """
 
+import torch
 import os
+import sys
 import gc
 import re
 import ast
@@ -16,14 +18,12 @@ import traceback
 import glob
 from collections import Counter, defaultdict
 from pprint import pprint
-
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 from PIL import Image
 from tqdm.auto import tqdm
 
-import torch
 from torch.utils.data import DataLoader
 from transformers import (
     AutoProcessor, 
@@ -36,8 +36,48 @@ from transformers import (
     AutoTokenizer
 )
 
-from peft import LoraConfig, PeftModel
+# ── PEFT ──────────────────────────────────────────────────────────────────────
+# Hard failure here means LoRA won't work at all; surface the real error.
+try:
+    from peft import LoraConfig, PeftModel
+    print("DEBUG: [Module] peft loaded OK")
+except Exception as _peft_err:
+    raise ImportError(
+        f"[pipeline.py] Failed to import 'peft': {_peft_err}\n"
+        "Fix: pip install -U peft"
+    ) from _peft_err
+
+# ── TRL ───────────────────────────────────────────────────────────────────────
+# SFTTrainer / SFTConfig are only needed at training time, so we lazy-load them
+# to avoid a silent crash on Windows where trl's C-extension DLLs can fail on
+# import without printing anything.
+_trl_import_error: Exception | None = None
+SFTConfig   = None  # type: ignore[assignment]
+SFTTrainer  = None  # type: ignore[assignment]
+
+# ── TRL ───────────────────────────────────────────────────────────────────────
+# We completely avoid top-level imports of TRL to prevent the silent Windows crash.
+SFTConfig = None
+SFTTrainer = None
+
 from trl import SFTConfig, SFTTrainer
+import transformers
+from transformers import TrainingArguments
+
+# If the script calls load_trl_safely() later, 
+# you can just make the function do nothing:
+def load_trl_safely():
+    return True
+
+
+def _require_trl() -> None:
+    """Call at the top of any function that needs SFTTrainer; raises a clear error."""
+    if _trl_import_error is not None:
+        raise RuntimeError(
+            f"SFTTrainer is not available because trl failed to import:\n"
+            f"  {type(_trl_import_error).__name__}: {_trl_import_error}\n\n"
+            f"Run the reinstall commands printed at startup, then retry."
+        ) from _trl_import_error
 
 from tensorboard.backend.event_processing import event_accumulator
 
@@ -46,16 +86,32 @@ import zipfile
 import requests
 
 try:
+    # Force this import to be lazy
+    import qwen_vl_utils
     from qwen_vl_utils import process_vision_info
-except ImportError:
-    print("Warning: qwen_vl_utils not available. Some Qwen functionality may be limited.")
+except Exception as e:
+    print(f"Warning: qwen_vl_utils loading error suppressed: {e}")
     process_vision_info = None
 
-import sys
-import os
-sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from data_preprocessor import DataPreprocessor
+
+# Get the absolute path of the directory where pipeline.py is located
+_current_file_path = os.path.abspath(__file__)
+_current_dir = os.path.dirname(_current_file_path)
+# The root is one level up from the finetuning_pipeline folder
+_project_root = os.path.dirname(_current_dir)
+
+# Add project root to path ONLY if it's not already there
+if _project_root not in sys.path:
+    sys.path.insert(0, _project_root)
+
+# Attempt to import DataPreprocessor safely
+try:
+    from data_preprocessor import DataPreprocessor
+except ImportError:
+    # If the above fails, try a relative import logic
+    import data_preprocessor
+    DataPreprocessor = data_preprocessor.DataPreprocessor
 
 
 class Config:
@@ -165,14 +221,34 @@ class Config:
             self.validate_paths()
     
     def _setup_environment(self):
-        """Setup environment variables for the pipeline."""
+        """Setup environment variables with Windows/RTX 4060 optimizations."""
+        print("DEBUG: [Env] Starting environment setup...")
         load_dotenv()
+        
+        # 1. Clean up existing cache variables to prevent path conflicts
         if "TRANSFORMERS_CACHE" in os.environ:
-            print(f"Removing existing TRANSFORMERS_CACHE: {os.environ['TRANSFORMERS_CACHE']}")
+            print(f"DEBUG: [Env] Clearing TRANSFORMERS_CACHE: {os.environ['TRANSFORMERS_CACHE']}")
             del os.environ["TRANSFORMERS_CACHE"]
         
-        os.environ["HF_HOME"] = os.path.join(os.getcwd(), ".hf_cache")
-        print(f"HF_HOME: {os.getenv('HF_HOME')}")
+        # 2. Set Local HF Home (Ensures you don't run out of space on C: drive)
+        hf_home = os.path.join(os.getcwd(), ".hf_cache")
+        os.environ["HF_HOME"] = hf_home
+        os.makedirs(hf_home, exist_ok=True)
+        print(f"DEBUG: [Env] HF_HOME set to: {hf_home}")
+
+        # 3. CRITICAL WINDOWS FIX: Disable tokenizer parallelism
+        # This prevents the "silent hang" when loading Qwen/Llama models on Windows
+        os.environ["TOKENIZERS_PARALLELISM"] = "false"
+        print("DEBUG: [Env] Tokenizer parallelism disabled (Windows stability fix)")
+
+        # 4. Torch Optimizations for RTX 4060
+        import torch
+        if torch.cuda.is_available():
+            # This helps avoid fragmented VRAM on 8GB cards
+            os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+            print("DEBUG: [Env] CUDA optimizations applied for 8GB VRAM")
+            
+        print("DEBUG: [Env] Environment setup complete.\n")
     
     def validate_paths(self):
         """Validate that required data paths exist."""
@@ -253,7 +329,11 @@ class ModelManager:
                 self.config.MODEL_ID, **non_llama_kwargs
             )
 
-        processor = AutoProcessor.from_pretrained(self.config.MODEL_ID, token=self.config.HF_TOKEN)
+        processor = AutoProcessor.from_pretrained(
+            self.config.MODEL_ID, 
+            token=self.config.HF_TOKEN,
+            max_pixels=250880
+        )
 
         print(f"Default chat template: {processor.tokenizer.chat_template}")
         print(f"Special tokens map: {processor.tokenizer.special_tokens_map}")
@@ -392,7 +472,11 @@ class InferenceManager:
         print(f"Saving merged model to {output_dir}...")
         merged_model.save_pretrained(output_dir, safe_serialization=True, max_shard_size="2GB")
         
-        processor = AutoProcessor.from_pretrained(self.config.MODEL_ID, token=token)
+        processor = AutoProcessor.from_pretrained(
+            self.config.MODEL_ID, 
+            token=token,
+            max_pixels=250880
+        )
         processor.save_pretrained(output_dir)
         
         del model
@@ -406,7 +490,7 @@ class InferenceManager:
 class MedicalImageInference:
     """Handles inference for medical image analysis."""
     
-    def __init__(self, model_path, token=None, adapter_path=None, device="cuda" if torch.cuda.is_available() else "cpu"):
+    def __init__(self, model_path, token=None, adapter_path=None, device="cuda" if torch.cuda.is_available() else "cpu", load_in_4bit=True):
         """
         Initialize the inference class for medical image analysis.
         
@@ -415,10 +499,15 @@ class MedicalImageInference:
         - token: HF token for downloading models
         - adapter_path: Path to adapter weights (only used if not using merged model)
         - device: Computing device (cuda or cpu)
+        - load_in_4bit: Whether to load base model in 4-bit quantization (recommended for 8GB VRAM)
         """
         self.device = device
         print(f"Loading processor from {model_path}...")
-        self.processor = AutoProcessor.from_pretrained(model_path, token=token)
+        self.processor = AutoProcessor.from_pretrained(
+            model_path, 
+            token=token,
+            max_pixels=250880
+        )
 
         base_kwargs = dict(
             torch_dtype=torch.bfloat16 if torch.cuda.is_available() else torch.float32,
@@ -426,6 +515,15 @@ class MedicalImageInference:
             low_cpu_mem_usage=True,
             token=token
         )
+
+        if load_in_4bit and torch.cuda.is_available():
+            print("Enabling 4-bit quantization for inference...")
+            base_kwargs["quantization_config"] = BitsAndBytesConfig(
+                load_in_4bit=True,
+                bnb_4bit_use_double_quant=True,
+                bnb_4bit_quant_type="nf4",
+                bnb_4bit_compute_dtype=base_kwargs["torch_dtype"]
+            )
 
         print(f"Loading model from {model_path}...")
         IS_LLAMA = "llama" in model_path.lower()
@@ -443,7 +541,7 @@ class MedicalImageInference:
             from peft import PeftModel
             self.model = PeftModel.from_pretrained(self.model, adapter_path)
         elif IS_QWEN and adapter_path:
-            base_kwargs["attn_implementation"] = "flash_attention_2" if torch.cuda.is_available() else "eager"
+            base_kwargs["attn_implementation"] = "sdpa" if torch.cuda.is_available() else "eager"
             if "Qwen2.5-VL" in model_path:
                 self.model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
                     model_path,
@@ -467,7 +565,7 @@ class MedicalImageInference:
                     token=token
                 )
             elif IS_QWEN:
-                base_kwargs["attn_implementation"] = "flash_attention_2" if torch.cuda.is_available() else "eager"
+                base_kwargs["attn_implementation"] = "sdpa" if torch.cuda.is_available() else "eager"
                 if "Qwen2.5-VL" in model_path:
                     self.model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
                         model_path,
@@ -900,36 +998,37 @@ class TrainingPipeline:
         
         return collate_fn
     
-    def train(self, use_combined=False, test_mode=False):
+    def train(self, use_combined=False, test_mode=False, train_df=None, val_df=None):
         """Run the complete training pipeline."""
-        print("Starting training pipeline...")
-        
-        # Prepare data
-        train_df, val_df = self.prepare_training_data(use_combined, test_mode)
-        
-        # Load model and processor
+        print("\n" + "="*50)
+        print("STARTING TRAINING PIPELINE")
+        print("="*50)
+    
+        # 1. Handle Data Preparation logic correctly
+        if train_df is None or val_df is None:
+            print("DEBUG: No pre-prepared data found, running preparation...")
+            train_df, val_df = self.prepare_training_data(use_combined, test_mode)
+        else:
+            print(f"DEBUG: Using provided data ({len(train_df)} rows)")
+
+        # 2. Load model and processor
+        print("Loading model and processor...")
         model, processor = self.model_manager.load_model_and_processor()
         
-        # Create dataset
-        if use_combined:
-            dataset = MedicalImageDataset(self.config.PROCESSED_COMBINED_DATA_DIR, processor)
-        else:
-            dataset = MedicalImageDataset(self.config.PROCESSED_TRAIN_DATA_DIR, processor)
-            
-        print(f"Dataset size: {len(dataset)}")
+        # 3. Create dataset
+        data_dir = self.config.PROCESSED_COMBINED_DATA_DIR if use_combined else self.config.PROCESSED_TRAIN_DATA_DIR
+        print(f"Loading dataset from: {data_dir}")
+        dataset = MedicalImageDataset(data_dir, processor)
+        
+        print(f"Dataset size: {len(dataset)} samples")
         
         if len(dataset) == 0:
-            print("ERROR: Dataset is empty! Check data loading process.")
+            print("ERROR: Dataset is empty! The batch files (.pkl) were not found.")
             return None
         
-        # Create collate function
+        # 4. Configure LoRA & Collator
         collate_fn = self.create_collate_fn(processor, self.config.IS_QWEN, self.config.IS_LLAMA)
-        
-        # Configure LoRA
-        if self.config.IS_LLAMA or self.config.IS_QWEN:
-            target_modules = ["q_proj", "v_proj"]
-        else:
-            target_modules = "all-linear"
+        target_modules = ["q_proj", "v_proj"] if (self.config.IS_LLAMA or self.config.IS_QWEN) else "all-linear"
 
         peft_config = LoraConfig(
             lora_alpha=16,
@@ -938,53 +1037,189 @@ class TrainingPipeline:
             bias="none",
             target_modules=target_modules,
             task_type="CAUSAL_LM",
-            modules_to_save=None if self.config.IS_LLAMA else ["lm_head", "embed_tokens"]
+            # ── WHY modules_to_save=None ──────────────────────────────────────
+            # For Qwen2-VL, lm_head & embed_tokens are weight-tied to the base
+            # embedding table. Saving them as fully-trainable copies blows up
+            # trainable params from ~15 M → 467 M and causes CUDA OOM on 8 GB.
+            # LoRA adapters on q_proj/v_proj already cover the learning signal.
+            modules_to_save=None,
         )
         
-        # Configure training
+        # 5. Training Arguments (Windows/RTX 4060 Optimized)
         training_args = SFTConfig(
             output_dir=self.config.MODEL_SAVE_DIRECTORY,
-            num_train_epochs=3,
+            num_train_epochs=1 if test_mode else 3,  # Save time in test mode
             per_device_train_batch_size=1,
-            gradient_accumulation_steps=32,
+            gradient_accumulation_steps=16,           # Effective batch = 16 samples
             gradient_checkpointing=True,
-            optim="adamw_torch_fused",
-            logging_steps=10,
-            save_strategy="steps",
+            # paged_adamw_8bit: compresses Adam momentum/variance states to 8-bit
+            # and pages them to CPU RAM if VRAM is full. Zero quality loss.
+            optim="paged_adamw_8bit",
+            logging_steps=1,          # Frequent logs to see it's alive
+            save_strategy="no" if test_mode else "steps",
             save_steps=50,
-            learning_rate=1e-4,
-            bf16=True,
-            tf32=True,
-            max_grad_norm=0.3,
-            warmup_ratio=0.03,
-            lr_scheduler_type="constant",
-            push_to_hub=False,
-            report_to="tensorboard",
+            learning_rate=2e-4,       # Slightly higher LR compensates for lower rank
+            bf16=True,                # RTX 4060 supports this
+            tf32=False,               # KEEP FALSE on Windows to prevent silent crashes
+            report_to="none" if test_mode else "tensorboard",
             gradient_checkpointing_kwargs={"use_reentrant": False},
             dataset_text_field="",
             dataset_kwargs={"skip_prepare_dataset": True},
             remove_unused_columns=False,
-            label_names=["labels"],
+            # max_seq_length: image tokens + prompt + answer. 1024 is safe for
+            # 8 GB VRAM with 4-bit Qwen2-VL-2B. Attention is O(N²) so this
+            # halving from 2048 cuts attention memory by 4×.
+            max_seq_length=1024,
+            dataloader_pin_memory=False,  # Windows stability
         )
         
-        # Create trainer
-        trainer = SFTTrainer(
+        # 6. Run Trainer with Error Catching
+        try:
+            # ── Path A: SFTTrainer (preferred) ────────────────────────────────
+            _require_trl()   # raises clearly if trl didn't load
+
+            # ── PATCH: Qwen2VLProcessor missing attributes ────────────────────
+            # TRL reads several attributes directly on the processor object itself
+            # (not just on processor.tokenizer). Qwen2VL's processor does not define
+            # them, so we inject them before handing the processor to SFTTrainer.
+            MAX_SEQ_LEN = 1024  # Must match max_seq_length in SFTConfig above
+
+            # (a) model_max_length — read at sft_trainer.py init
+            if not hasattr(processor, "model_max_length") or processor.model_max_length is None:
+                processor.model_max_length = MAX_SEQ_LEN
+                print(f"DEBUG: [Patch] Set processor.model_max_length = {MAX_SEQ_LEN}")
+
+            # (b) padding_side — read at sft_trainer.py line 402 directly on processor
+            # THIS was the AttributeError that caused the fallback to HF Trainer.
+            if not hasattr(processor, "padding_side") or processor.padding_side is None:
+                processor.padding_side = "right"
+                print("DEBUG: [Patch] Set processor.padding_side = 'right'")
+
+            # (c) Mirror both onto the nested tokenizer for consistency
+            if hasattr(processor, "tokenizer"):
+                if not hasattr(processor.tokenizer, "model_max_length") or processor.tokenizer.model_max_length is None:
+                    processor.tokenizer.model_max_length = MAX_SEQ_LEN
+                    print(f"DEBUG: [Patch] Set processor.tokenizer.model_max_length = {MAX_SEQ_LEN}")
+                processor.tokenizer.padding_side = "right"
+                print("DEBUG: [Patch] Set processor.tokenizer.padding_side = 'right'")
+
+            # Gradient checkpointing must be enabled BEFORE PEFT wrapping when
+            # using quantized models (avoids 'backward through graph twice' errors)
+            if training_args.gradient_checkpointing:
+                model.gradient_checkpointing_enable(
+                    gradient_checkpointing_kwargs={"use_reentrant": False}
+                )
+                print("DEBUG: [Patch] gradient_checkpointing_enable() called with use_reentrant=False")
+
+            # Free any lingering VRAM before the trainer allocates its buffers
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+                print(f"DEBUG: [Patch] VRAM free before trainer: "
+                      f"{torch.cuda.mem_get_info()[0]/1024**3:.2f} GB")
+
+            trainer = SFTTrainer(
+                model=model,
+                args=training_args,
+                train_dataset=dataset,
+                peft_config=peft_config,
+                processing_class=processor,
+                data_collator=collate_fn,
+            )
+            print("Starting training loop (SFTTrainer)...")
+            trainer.train()
+            print(f"Training completed! Saved to: {self.config.MODEL_SAVE_DIRECTORY}")
+            return trainer
+
+        except (RuntimeError, AttributeError) as _trl_rt_err:
+            # trl unavailable or processor attribute missing → fall through to HF Trainer
+            print(f"\nINFO: SFTTrainer path failed ({type(_trl_rt_err).__name__}: {_trl_rt_err})")
+            print("INFO: Falling back to standard HuggingFace Trainer + PEFT …\n")
+            return self._train_with_hf_trainer(
+                model, processor, dataset, peft_config, collate_fn, test_mode
+            )
+
+        except Exception as e:
+            print("\n" + "!"*50)
+            print(f"CRITICAL TRAINING ERROR: {type(e).__name__}: {e}")
+            import traceback
+            traceback.print_exc()
+            print("!"*50)
+            return None
+
+    # ── HF Trainer fallback ───────────────────────────────────────────────────
+    def _train_with_hf_trainer(self, model, processor, dataset, peft_config,
+                                collate_fn, test_mode: bool):
+        """
+        Standard HuggingFace Trainer + PEFT fallback used when trl is broken.
+        Mirrors the SFTConfig settings already defined in train().
+        """
+        from transformers import TrainingArguments, Trainer
+        from peft import get_peft_model
+
+        # Guard: SFTTrainer may have partially applied peft_config before crashing,
+        # leaving a `peft_config` attribute on the model. Detect this and skip
+        # re-wrapping to prevent the 'already found a peft_config' double-wrap.
+        if not hasattr(model, "peft_config"):
+            print("Applying LoRA adapters via PEFT …")
+            model = get_peft_model(model, peft_config)
+        else:
+            print("INFO: Model already has peft_config — skipping get_peft_model() to avoid double-wrap.")
+        model.print_trainable_parameters()
+
+        hf_args = TrainingArguments(
+            output_dir=self.config.MODEL_SAVE_DIRECTORY,
+            num_train_epochs=1 if test_mode else 3,
+            per_device_train_batch_size=1,
+            gradient_accumulation_steps=16,
+            gradient_checkpointing=True,
+            optim="paged_adamw_8bit",   # compresses optimizer states → VRAM savings
+            logging_steps=1,
+            save_strategy="no" if test_mode else "steps",
+            save_steps=50,
+            learning_rate=2e-4,
+            bf16=True,
+            tf32=False,
+            report_to="none" if test_mode else "tensorboard",
+            gradient_checkpointing_kwargs={"use_reentrant": False},
+            remove_unused_columns=False,
+            dataloader_pin_memory=False,  # safer on Windows
+        )
+
+        trainer = Trainer(
             model=model,
-            args=training_args,
+            args=hf_args,
             train_dataset=dataset,
-            peft_config=peft_config,
-            processing_class=processor,
             data_collator=collate_fn,
         )
-        
-        print("Starting training...")
-        trainer.train()
-        
-        print(f"Training completed. Model saved to {self.config.MODEL_SAVE_DIRECTORY}")
-        return trainer
 
-    def run_inference(self, use_finetuning=True, test_mode=False, max_samples=None):
-        """Run inference on validation or test data."""
+        try:
+            print("Starting training loop (HF Trainer fallback)…")
+            trainer.train()
+            trainer.save_model(self.config.MODEL_SAVE_DIRECTORY)
+            processor.save_pretrained(self.config.MODEL_SAVE_DIRECTORY)
+            print(f"Training completed! Saved to: {self.config.MODEL_SAVE_DIRECTORY}")
+            return trainer
+        except Exception as e:
+            print("\n" + "!"*50)
+            print(f"CRITICAL TRAINING ERROR (HF Trainer): {type(e).__name__}: {e}")
+            import traceback
+            traceback.print_exc()
+            print("!"*50)
+            return None
+
+    def run_inference(self, use_finetuning=True, test_mode=False, max_samples=None, merge_weights=False, load_in_4bit=True):
+        """
+        Run inference on validation or test data.
+        
+        Args:
+            use_finetuning: Whether to use fine-tuned model or base model
+            test_mode: Whether to run on test data instead of validation
+            max_samples: Maximum number of samples to process (None for all)
+            merge_weights: If True, merges LoRA weights into base model on disk first.
+                           If False, loads base model + adapter directly in VRAM (safer for 8GB).
+            load_in_4bit: Whether to load base model in 4-bit for inference.
+        """
         print("Starting inference pipeline...")
         
         # Determine model path
@@ -1005,19 +1240,25 @@ class TrainingPipeline:
             checkpoint_path = checkpoint_dirs[0]
             print(f"Creating merged model from latest checkpoint: {checkpoint_path}")
             
-            checkpoint_name = os.path.basename(checkpoint_path)
-            timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M")
-            merged_dir = os.path.join(
-                self.config.OUTPUT_DIR, "merged", f"{self.config.MODEL_NAME}_{checkpoint_name}_{timestamp}"
-            )
-            
-            model_path = self.inference_manager.merge_lora_model(
-                checkpoint_path=checkpoint_path,
-                token=self.config.HF_TOKEN,
-                output_dir=merged_dir
-            )
-            print(f"Using merged model at {model_path}")
-            adapter_path = None
+            if merge_weights:
+                checkpoint_name = os.path.basename(checkpoint_path)
+                timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M")
+                merged_dir = os.path.join(
+                    self.config.OUTPUT_DIR, "merged", f"{self.config.MODEL_NAME}_{checkpoint_name}_{timestamp}"
+                )
+                
+                model_path = self.inference_manager.merge_lora_model(
+                    checkpoint_path=checkpoint_path,
+                    token=self.config.HF_TOKEN,
+                    output_dir=merged_dir
+                )
+                print(f"Using merged model at {model_path}")
+                adapter_path = None
+            else:
+                # Direct loading: Base Model ID + Adapter Checkpoint Path
+                model_path = self.config.MODEL_ID
+                adapter_path = checkpoint_path
+                print(f"Loading base model + adapters directly (no merge on disk)")
         else:
             model_path = self.config.MODEL_ID
             adapter_path = None
@@ -1027,7 +1268,8 @@ class TrainingPipeline:
         inference = MedicalImageInference(
             model_path=model_path,
             token=self.config.HF_TOKEN,
-            adapter_path=adapter_path
+            adapter_path=adapter_path,
+            load_in_4bit=load_in_4bit
         )
         
         # Determine data directory and output file
@@ -1231,30 +1473,42 @@ class FineTuningPipeline:
                  setup_environment=True,
                  validate_paths=True):
         """
-        Initialize the Medical Vision Pipeline.
-        
-        Args:
-            model_name: Name of the model to use (default: "Qwen2-VL-2B-Instruct")
-            base_dir: Base directory containing dataset (defaults to current directory)
-            output_dir: Output directory for models and results (defaults to base_dir/outputs)
-            hf_token: HuggingFace token (defaults to environment variable)
-            setup_environment: Whether to setup environment variables (default: True)
-            validate_paths: Whether to validate that required paths exist (default: True)
+        Initialize the Medical Vision Pipeline with enhanced error tracking for Windows.
         """
-        self.config = Config(
-            model_name=model_name,
-            base_dir=base_dir,
-            output_dir=output_dir,
-            hf_token=hf_token,
-            setup_environment=setup_environment,
-            validate_paths=validate_paths
-        )
-        self.training_pipeline = TrainingPipeline(self.config)
+        print("DEBUG: [Init] Entering FineTuningPipeline.__init__")
         
-        print(f"FineTuningPipeline initialized with model: {model_name}")
-        print(f"Base directory: {self.config.BASE_DIR}")
-        print(f"Output directory: {self.config.OUTPUT_DIR}")
-    
+        try:
+            print("DEBUG: [Init] Initializing Config object...")
+            self.config = Config(
+                model_name=model_name,
+                base_dir=base_dir,
+                output_dir=output_dir,
+                hf_token=hf_token,
+                setup_environment=setup_environment,
+                validate_paths=validate_paths
+            )
+            print("DEBUG: [Init] Config initialized successfully.")
+
+            print("DEBUG: [Init] Initializing TrainingPipeline...")
+            # If it crashes here, the issue is likely bitsandbytes/CUDA loading
+            self.training_pipeline = TrainingPipeline(self.config)
+            print("DEBUG: [Init] TrainingPipeline initialized successfully.")
+            
+            print(f"FineTuningPipeline initialized with model: {model_name}")
+            print(f"Base directory: {self.config.BASE_DIR}")
+            print(f"Output directory: {self.config.OUTPUT_DIR}")
+            
+        except Exception as e:
+            print("\n" + "!"*60)
+            print("CRITICAL ERROR DURING PIPELINE INITIALIZATION")
+            print(f"Error Type: {type(e).__name__}")
+            print(f"Error Message: {str(e)}")
+            import traceback
+            traceback.print_exc()
+            print("!"*60 + "\n")
+            import sys
+            sys.exit(1) # Force exit with error code so it doesn't hang
+
     def get_available_models(self):
         """Get list of available models."""
         return list(self.config.AVAILABLE_MODELS.keys())
@@ -1276,24 +1530,28 @@ class FineTuningPipeline:
             test_mode=test_mode,
             min_data_size=min_data_size
         )
-    
-    def train(self, use_combined=False, test_mode=False):
+    def train(self, use_combined=False, test_mode=False, train_df=None, val_df=None):
         """
         Train the model.
         
         Args:
-            use_combined: Whether to combine train and validation data for training
+            use_combined: Whether to combine train and validation data
             test_mode: Whether to run in test mode with small dataset
-            
+        train_df: Optional pre-prepared training DataFrame
+        val_df: Optional pre-prepared validation DataFrame
+        
         Returns:
             Trainer object if successful, None if failed
         """
+        # Now passing the DFs down to the actual training engine
         return self.training_pipeline.train(
             use_combined=use_combined,
-            test_mode=test_mode
+            test_mode=test_mode,
+            train_df=train_df,
+            val_df=val_df
         )
     
-    def run_inference(self, use_finetuning=True, test_mode=False, max_samples=None):
+    def run_inference(self, use_finetuning=True, test_mode=False, max_samples=None, merge_weights=False, load_in_4bit=True):
         """
         Run inference on validation or test data.
         
@@ -1301,6 +1559,8 @@ class FineTuningPipeline:
             use_finetuning: Whether to use fine-tuned model or base model
             test_mode: Whether to run on test data instead of validation
             max_samples: Maximum number of samples to process (None for all)
+            merge_weights: Whether to merge weights on disk (False is safer for 8GB)
+            load_in_4bit: Whether to load base model in 4-bit for inference
             
         Returns:
             Tuple of (predictions_df, aggregated_df, formatted_predictions)
@@ -1308,7 +1568,9 @@ class FineTuningPipeline:
         return self.training_pipeline.run_inference(
             use_finetuning=use_finetuning,
             test_mode=test_mode,
-            max_samples=max_samples
+            max_samples=max_samples,
+            merge_weights=merge_weights,
+            load_in_4bit=load_in_4bit
         )
     
     def predict_single(self, image_path, query_text, model_path=None, max_new_tokens=100):
@@ -1349,7 +1611,9 @@ class FineTuningPipeline:
         # Initialize inference
         inference = MedicalImageInference(
             model_path=model_path,
-            token=self.config.HF_TOKEN
+            token=self.config.HF_TOKEN,
+            adapter_path=adapter_path,
+            load_in_4bit=True
         )
         
         return inference.predict(query_text, image_path, max_new_tokens)

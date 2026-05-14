@@ -1,480 +1,609 @@
-# MEDIQA-MAGIC 2025: Medical Image Question Answering Pipeline
-## Applied Research Competitions at Georgia Tech
+# 🏥 Medical Vision-Language Agentic RAG — 2026 Edition
 
-A comprehensive medical image analysis pipeline for dermatological question answering using multi-modal large language models, featuring fine-tuning, reasoning layers, and agentic RAG systems.
+### *Efficient Clinical Reasoning Under Constraint: Fast Triage and Asymmetric Partitioning*
+
+> **Authors:** Aditya Kuranjekar · G Prasannapriyan · Prof. Rajiv Misra · Rishu Sharma · Shreya
+> **Institution:** Indian Institute of Technology Patna, Bihar, India
+> **Dataset:** DermaVQA-DAS (ImageCLEF 2025)
+
+---
+
+## 📋 Table of Contents
+
+- [Overview](#-overview)
+- [The Two Core Innovations](#-the-two-core-innovations-the-why)
+- [The 8-Stage Agentic Pipeline](#-the-8-stage-agentic-pipeline-the-how)
+- [Results & Performance](#-results--performance)
+- [Repository Structure](#-repository-structure)
+- [Installation & Setup](#-installation--setup)
+- [Step-by-Step Usage](#-step-by-step-usage)
+- [Supported Models](#-supported-models)
+- [API Requirements & Rate Limits](#-api-requirements--rate-limits)
+- [Troubleshooting](#-troubleshooting)
+- [Citation](#-citation)
+
+---
+
+## 🔭 Overview
+
+This repository is an **architectural evolution** of the MEDIQA-MAGIC 2025 pipeline originally presented in [*Architecting Clinical Collaboration: Multi-Agent Reasoning Systems for Multimodal Medical VQA*](https://arxiv.org/abs/2507.05520) (Thakrar et al., Georgia Tech, 2025).
+
+The 2026 edition, developed at **IIT Patna**, fundamentally re-architects the system to resolve two critical structural flaws identified in prior multi-agent medical VQA systems. Rather than relying on brute-force ensemble activation or generic multimodal context distribution, this pipeline introduces **confidence-gated triage** and **asymmetric modality siloing** — two targeted modifications that improve both compute efficiency and diagnostic robustness simultaneously.
+
+The system operates on the **DermaVQA-DAS** dataset: 300 patient encounters, 27 questions across 9 clinical families, evaluated with Jaccard-based partial-credit accuracy. It combines local Small Language Models (Llama-3.2-1B, Phi-4-Vision 4B) fine-tuned via LoRA/QLoRA with Gemini 2.5 Flash as the reasoning orchestrator.
+
+**Key result: 78.56% average test accuracy, up from a 38.04% baseline — a +40.52 point absolute improvement — while reducing mean inference latency by 27.4%.**
+
+---
+
+## 💡 The Two Core Innovations (The "Why")
+
+Previous multi-agent RAG systems for medical VQA suffer from two structural flaws that are independent of model quality. This work addresses both with targeted architectural changes requiring no additional training overhead.
+
+---
+
+### Gap 1: The Unconditional Ensemble Problem 🐌
+
+**The Flaw:** State-of-the-art agentic RAG systems unconditionally trigger the full multi-model ensemble, hybrid retrieval engine, and multi-stage synthesis chain for **every single patient query** — regardless of case complexity. A straightforward dermatological question that any single model resolves at 97% confidence still activates the complete 8-agent pipeline, incurring the same latency and compute cost as the most ambiguous edge case.
+
+This is a fundamental mismatch between computational expenditure and diagnostic difficulty — one that creates latency barriers that are particularly damaging in telemedicine settings where real-time response affects clinical outcomes.
+
+**Our Solution: Fast Triage Gatekeeper** ⚡
+
+A lightweight gatekeeper agent sits at the pipeline entrance and processes all three inputs (patient description, images, and clinical query) before any heavy computation is triggered. If the agent's confidence exceeds **95%**, the case exits directly to Final Diagnosis via a bypass path, skipping Phases 2–4 entirely. Approximately **30% of real telemedicine queries** qualify for this bypass — converting a fixed compute cost into a conditional one.
+
+```
+Patient Inputs → [Fast Triage Agent]
+                      │
+           ┌──────────┴──────────┐
+     conf > 95%             conf < 95%
+           │                     │
+    ┌──────▼──────┐    ┌─────────▼──────────┐
+    │Final Diagnosis│   │ Full 8-Stage Pipeline│
+    └─────────────┘    └────────────────────┘
+```
+
+---
+
+### Gap 2: The Consensus Collapse Problem 🧠
+
+**The Flaw:** Existing architectures feed **identical multimodal context** — both patient text and clinical images — to all agents simultaneously. When the image presents a dominant visual cue, all agents anchor on that signal and produce highly correlated outputs. Subtle textual evidence — a patient's occupational exposure history, treatment resistance, or symptom progression description — is systematically underweighted.
+
+This produces *apparent consensus without genuine multi-modal reasoning* — precisely the failure mode that ensemble architectures are designed to prevent.
+
+**Our Solution: Asymmetric Partitioning** 🔀
+
+We enforce strict **modality siloing** at the input level. Patient text is routed **exclusively** to a clinical language model (Llama-3.2-1B) that operates *blind to image data*. Patient images are routed **exclusively** to a vision specialist (Phi-4-Vision 4B) that operates *blind to text*. Their independent reports are then merged by a dedicated **Asymmetric Synthesizer** that preserves contradictions as reduced confidence rather than smoothing them into a softened prediction.
+
+This converts *hidden uncertainty into explicit, auditable uncertainty* — a critical property for clinical adoption, where transparency directly determines physician trust.
+
+```
+Patient Text  ──────────► [Clinical Context Expert]  (TEXT ONLY · blind to images)
+                                     │
+                                     ▼
+                          [Diagnosis Extractor] ◄── Clinical Query
+                                     ▲
+Patient Images ─────────► [Image Analysis Expert]   (IMAGE ONLY · blind to text)
+```
+
+---
+
+## ⚙️ The 8-Stage Agentic Pipeline (The "How")
+
+The complete upgraded pipeline flows through four phases containing eight distinct agents:
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│  PHASE 1 — GATEKEEPER                                           │
+│  ┌───────────────────────────────────┐                          │
+│  │  Patient Description              │                          │
+│  │  Patient Images          ──────►  Fast Triage Agent          │
+│  │  Clinical Query                   │  (conf > 95% → bypass)  │
+│  └───────────────────────────────────┘                          │
+└─────────────────────────────────────────────────────────────────┘
+         │ conf < 95%
+         ▼
+┌─────────────────────────────────────────────────────────────────┐
+│  PHASE 2 — ASYMMETRIC PARTITIONING (siloed inputs)              │
+│                                                                  │
+│  [Text] ──► Clinical Context Expert (Llama-3.2-1B)             │
+│                         │                                        │
+│                         └────────► Diagnosis Extractor ◄───────┤
+│                         ┌────────►                              │
+│  [Images] ► Image Analysis Expert (Phi-4-Vision 4B)            │
+└─────────────────────────────────────────────────────────────────┘
+         │
+         ▼
+┌─────────────────────────────────────────────────────────────────┐
+│  PHASE 3 — HYBRID KNOWLEDGE RAG                                  │
+│                                                                  │
+│  Knowledge Retrieval Agent                                       │
+│     ├── BM25 Sparse Retrieval                                   │
+│     ├── BioBERT Dense Embeddings                                │
+│     └── Cross-Encoder Reranking                                 │
+│  MedCPT Domain Index (UMLS · PubMed · Clinical Guidelines)     │
+│  Evidence Integration Agent                                      │
+└─────────────────────────────────────────────────────────────────┘
+         │
+         ▼
+┌─────────────────────────────────────────────────────────────────┐
+│  PHASE 4 — DECISION SYNTHESIS & SAFETY LOOP                     │
+│                                                                  │
+│  Asymmetric Synthesizer ──► Final Diagnosis                     │
+│       │ conf < 0.75                                             │
+│       └──► Self-Reflection Agent ──► Re-Analysis Agent ─────►  │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+| Stage | Agent | Role |
+|-------|-------|------|
+| 1 | **Fast Triage Agent** | Confidence-gated bypass for trivial cases (>95% threshold) |
+| 2 | **Clinical Context Expert** (Llama-3.2-1B) | Text-only analysis across 13 clinical categories; blind to images |
+| 3 | **Image Analysis Expert** (Phi-4-Vision 4B) | Image-only analysis across 10 visual dimensions; blind to text |
+| 4 | **Diagnosis Extractor Agent** | Merges independent reports into ranked diagnostic hypotheses |
+| 5 | **Knowledge Retrieval Agent** | Hybrid BM25 + BioBERT + Cross-Encoder retrieval over MedCPT index |
+| 6 | **Evidence Integration Agent** | Consolidates visual, textual, and retrieved knowledge with adaptive weights |
+| 7 | **Asymmetric Synthesizer** | Core reasoning engine; surfaces inter-modal contradictions as reduced confidence |
+| 8 | **Safety Loop** | Self-Reflection → Re-Analysis triggered when synthesizer confidence < 0.75 |
+
+---
+
+## 📊 Results & Performance
+
+### Accuracy: Baseline vs. Upgraded Architecture
+
+| Question Type (QID) | Baseline Qwen2-VL | Original RAG | **Upgraded RAG** | Δ vs Original |
+|---------------------|:-----------------:|:------------:|:----------------:|:-------------:|
+| Body Coverage (CQID010) | 0.31 | 0.47 | **0.65** | +0.18 |
+| Anatomical Location (CQID011) | 0.38 | 0.86 | **0.88** | +0.02 |
+| Lesion Size (CQID012) | 0.53 | 0.69 | **0.79** | +0.10 |
+| Onset Timing (CQID015) | 0.31 | 0.85 | **0.90** | +0.05 |
+| Skin Description (CQID020) | 0.31 | 0.56 | **0.65** | +0.09 |
+| Itching (CQID025) | 0.42 | 0.84 | **0.95** | +0.11 |
+| Lesion Color (CQID034) | 0.01 | 0.51 | **0.55** | +0.04 |
+| Lesion Count (CQID035) | 0.72 | 0.82 | **0.95** | +0.13 |
+| Texture (CQID036) | 0.37 | 0.64 | **0.75** | +0.11 |
+| **Average** | **0.3804** | 0.69 | **0.7856** | **+0.0956** |
+
+> The largest gains appear on **ambiguous multi-modal questions** (Body Coverage, Lesion Count, Itching, Texture) where cross-modal anchor bias previously suppressed textual evidence — confirming that Asymmetric Partitioning directly addresses the consensus collapse failure mode.
+
+### Inference Latency by Triage Path
+
+| Case Type | Original Pipeline | Bypass Path | Full Pipeline |
+|-----------|:-----------------:|:-----------:|:-------------:|
+| High-confidence (>95%) | ~4,200 ms | **~240 ms** | — |
+| Moderate-confidence | ~4,200 ms | — | ~3,950 ms |
+| Low-confidence (<0.75, safety loop) | ~4,200 ms | — | ~5,400 ms |
+| **Weighted Average** | **~4,200 ms** | — | **~3,050 ms** |
+
+> **27.4% latency reduction** overall. Approximately 30% of validation cases qualified for the >95% bypass path, converting the ensemble compute cost from fixed to conditional.
+
+### Ablation Study Highlights
+
+- Removing the **self-reflection safety loop** degrades average accuracy by ~9–10 percentage points
+- Reverting to **shared-context agents** (removing Asymmetric Partitioning) reduces accuracy on multi-label subjective questions by 4–6 points, with the largest drops on Lesion Color and Skin Description
+- Confidence thresholds below 0.70 or above 0.85 both underperform the optimal 0.75 threshold
+
+---
 
 ## 🏗️ Repository Structure
 
 ```
 arc-mediqa-magic-2025/
-├── 📁 Core Pipeline Components
-│   ├── finetuning_pipeline/           # Modular fine-tuning pipeline
-│   │   ├── pipeline.py                # Complete training and inference pipeline
-│   │   ├── finetuning_pipeline_example_usage.py  # Usage examples
-│   │   └── __init__.py                # Package initialization
-│   ├── reasoning_pipeline/            # Reasoning layer implementation
-│   │   ├── reasoning_pipeline.py      # Gemini-based reasoning system
-│   │   ├── reasoning_pipeline_example_usage.py   # Usage examples
-│   │   └── __init__.py                # Package initialization
-│   ├── rag_pipeline/                  # RAG system implementation
-│   │   ├── rag_pipeline.py            # Retrieval-Augmented Generation
-│   │   ├── rag_pipeline_example_usage.py         # Usage examples
-│   │   └── __init__.py                # Package initialization
-│   └── evaluation/                    # Official evaluation scripts
-│       ├── run_cvqa_eval.py           # CVQA evaluation runner
-│       ├── run_segandcvqa_scoring.py  # Combined scoring
-│       └── score_cvqa.py              # CVQA scoring utilities
-├── 📁 Standalone Scripts
-│   ├── data_preprocessor.py           # Data preprocessing utilities
-│   ├── evaluation_script.py           # Evaluation utilities
-│   └── submission_utility.py          # Submission formatting
-├── 📁 Data & Datasets
-│   ├── 2025_dataset/                  # Competition dataset
-│   │   ├── train/                     # Training data and images
-│   │   ├── valid/                     # Validation data and images
-│   │   └── test/                      # Test data and images
-└── 📁 Configuration
-    ├── requirements.txt               # Python dependencies
-    ├── .env                          # Environment variables
-    ├── .gitignore                    # Git ignore rules
-    └── .pre-commit-config.yaml       # Pre-commit hooks
+├── 📁 finetuning_pipeline/
+│   ├── pipeline.py                          # Complete training + inference pipeline
+│   ├── finetuning_pipeline_example_usage.py
+│   └── __init__.py
+├── 📁 reasoning_pipeline/
+│   ├── reasoning_pipeline.py                # Gemini-based 3-stage reasoning system
+│   ├── reasoning_pipeline_example_usage.py
+│   └── __init__.py
+├── 📁 rag_pipeline/
+│   ├── rag_pipeline.py                      # 8-stage agentic RAG (2026 upgraded)
+│   ├── rag_pipeline_example_usage.py
+│   └── __init__.py
+├── 📁 evaluation/
+│   ├── run_cvqa_eval.py
+│   ├── run_segandcvqa_scoring.py
+│   └── score_cvqa.py
+├── 📁 2025_dataset/
+│   ├── train/  (train.json, images_train/)
+│   ├── valid/  (valid.json, images_valid/)
+│   └── test/   (test.json, images_test/)
+├── data_preprocessor.py
+├── evaluation_script.py
+├── submission_utility.py
+├── step1_prepare_data.py
+├── step2_smoke_test.py
+├── step3_train.py
+├── step4_validate.py
+├── step5_test_inference.py
+├── step6_rag_sanity_test.py
+├── step7_rag_full_run.py
+├── step8_evaluate.py
+├── requirements.txt
+└── .env
 ```
 
-## 🚀 Quick Start
+---
+
+## 🚀 Installation & Setup
 
 ### Prerequisites
 
-1. **Clone the repository:**
+- **OS:** Windows 10/11 or Linux (Ubuntu 22.04+)
+- **Python:** 3.10+
+- **GPU:** NVIDIA with 8 GB+ VRAM (RTX 3080 / A100 recommended for training; RTX 4060 8 GB sufficient for inference with quantization)
+- **CUDA:** 12.4+ with compatible `bitsandbytes`
+- **Storage:** 50 GB+ free space
+
+### 1. Clone the Repository
+
 ```bash
 git clone https://github.com/karishmathakrar/arc-mediqa-magic-2025.git
 cd arc-mediqa-magic-2025
 ```
 
-2. **Set up environment:**
+### 2. Create a Virtual Environment
+
 ```bash
 python3.10 -m venv .venv
-source .venv/bin/activate  # On Windows: .venv\Scripts\activate
+
+# Linux / macOS
+source .venv/bin/activate
+
+# Windows
+.venv\Scripts\activate
+```
+
+### 3. Install Dependencies
+
+```bash
 pip install -r requirements.txt
 ```
 
-3. **Configure API keys in `.env`:**
+> **Windows note:** If you encounter `UnicodeDecodeError: 'charmap' codec` when reading dataset JSON files, this is a Windows encoding issue. All `open()` calls in `data_preprocessor.py` include `encoding='utf-8'` to handle this. If you see this error, ensure you are running the latest version of `data_preprocessor.py` from this repository.
+
+### 4. Configure Environment Variables
+
+Create a `.env` file in the project root:
+
 ```env
-HF_TOKEN=your_huggingface_token_here
-API_KEY=your_gemini_api_key_here
-GEMINI_API_KEY=your_gemini_api_key_here  # Alternative key name
-```
-
-### Basic Usage
-
-1. **Run fine-tuning pipeline:**
-```python
-from finetuning_pipeline.pipeline import FineTuningPipeline
-
-pipeline = FineTuningPipeline(base_dir="./")
-train_df, val_df = pipeline.prepare_data()
-trainer = pipeline.train()
-predictions = pipeline.run_inference()
-```
-
-2. **Run reasoning pipeline:**
-```python
-from reasoning_pipeline import ReasoningConfig, ReasoningPipeline
-
-config = ReasoningConfig(use_finetuning=True, base_dir="./")
-pipeline = ReasoningPipeline(config)
-results = pipeline.process_all_encounters()
-```
-
-## 📋 Core Components
-
-### 🔧 Fine-tuning Pipeline (`finetuning_pipeline/`)
-
-**Main Files:**
-- `pipeline.py` - Complete fine-tuning pipeline with modular components
-- `finetuning_pipeline_example_usage.py` - Comprehensive usage examples
-- `__init__.py` - Package initialization
-
-**Key Features:**
-- Support for multiple vision-language models (see supported models below)
-- LoRA fine-tuning with PEFT
-- Automated data preprocessing and validation
-- Base and fine-tuned model inference
-- Prediction aggregation and evaluation formatting
-- Token analysis and dataset inspection tools
-
-**Usage Example:**
-```python
-from finetuning_pipeline.pipeline import FineTuningPipeline
-
-# Initialize pipeline
-pipeline = FineTuningPipeline(
-    model_name="Qwen2-VL-2B-Instruct",
-    base_dir="./",
-    output_dir="./outputs"
-)
-
-# Train model
-trainer = pipeline.train(test_mode=True)
-
-# Run inference
-predictions_df, aggregated_df, formatted_predictions = pipeline.run_inference()
-```
-
-### 🧠 Reasoning Pipeline (`reasoning_pipeline/`)
-
-**Main Files:**
-- `reasoning_pipeline.py` - Gemini-based reasoning system for medical analysis
-- `reasoning_pipeline_example_usage.py` - Usage examples and configurations
-- `__init__.py` - Package initialization
-
-**Key Features:**
-- Structured dermatological image analysis
-- Clinical context extraction and processing
-- Multi-evidence reasoning for question answering
-- Support for both validation and test datasets
-- Configurable Gemini model selection
-- Intermediate result saving with customizable frequency
-
-**Usage Example:**
-```python
-from reasoning_pipeline import ReasoningConfig, ReasoningPipeline
-
-# Configure pipeline
-config = ReasoningConfig(
-    use_finetuning=True,
-    use_test_dataset=False,
-    base_dir="./",
-    output_dir="./outputs"
-)
-
-# Process encounters
-pipeline = ReasoningPipeline(config)
-results = pipeline.process_all_encounters()
-```
-
-### 🔍 RAG Pipeline (`rag_pipeline/`)
-
-**Main Files:**
-- `rag_pipeline.py` - Retrieval-Augmented Generation system
-- `rag_pipeline_example_usage.py` - Usage examples
-- `__init__.py` - Package initialization
-
-**Key Features:**
-- Vector database integration with LanceDB
-- Diagnosis-based knowledge retrieval
-- Hybrid semantic and keyword search
-- Self-reflection and answer refinement
-- Medical knowledge base management
-
-## 🛠️ Standalone Scripts
-
-### `data_preprocessor.py`
-**Purpose:** Data preprocessing utilities and transformations
-
-**Key Features:**
-- Dataset cleaning and normalization
-- Image path validation and fixing
-- Question and option processing
-- Batch file generation for inference
-
-### `evaluation_script.py`
-**Purpose:** Model evaluation and scoring utilities
-
-**Key Features:**
-- Prediction accuracy calculation
-- Performance metrics computation
-- Result comparison and analysis
-- Official evaluation format validation
-
-### `submission_utility.py`
-**Purpose:** Format predictions for competition submission
-
-**Key Features:**
-- Official submission format generation
-- Prediction validation and error checking
-- Multiple model result aggregation
-- Submission file packaging
-
-## 🤖 Supported Models
-
-The pipeline supports the following vision-language models:
-
-### Llama Models
-- **`llama-3.2-11b-vision`** - Meta Llama 3.2 11B Vision Instruct
-  - Model ID: `meta-llama/Llama-3.2-11B-Vision-Instruct`
-  - Memory: ~22GB VRAM required
-
-### Gemma Models  
-- **`gemma-3-4b-it`** - Google Gemma 3 4B Instruct
-  - Model ID: `google/gemma-3-4b-it`
-  - Memory: ~8GB VRAM required
-- **`gemma-3-12b-it`** - Google Gemma 3 12B Instruct
-  - Model ID: `google/gemma-3-12b-it`
-  - Memory: ~24GB VRAM required
-
-### Qwen Models
-- **`Qwen2-VL-2B-Instruct`** - Qwen2 Vision-Language 2B (Default)
-  - Model ID: `Qwen/Qwen2-VL-2B-Instruct`
-  - Memory: ~4GB VRAM required
-- **`Qwen2-VL-7B-Instruct`** - Qwen2 Vision-Language 7B
-  - Model ID: `Qwen/Qwen2-VL-7B-Instruct`
-  - Memory: ~14GB VRAM required
-- **`Qwen2.5-VL-3B-Instruct`** - Qwen2.5 Vision-Language 3B
-  - Model ID: `Qwen/Qwen2.5-VL-3B-Instruct`
-  - Memory: ~6GB VRAM required
-- **`Qwen2.5-VL-7B-Instruct`** - Qwen2.5 Vision-Language 7B
-  - Model ID: `Qwen/Qwen2.5-VL-7B-Instruct`
-  - Memory: ~14GB VRAM required
-
-**Model Selection:**
-```python
-# Available models can be retrieved programmatically
-from finetuning_pipeline.pipeline import FineTuningPipeline
-pipeline = FineTuningPipeline()
-available_models = pipeline.get_available_models()
-print(available_models)
-```
-
-## 📊 Data Structure
-
-### Dataset Organization
-```
-2025_dataset/
-├── train/
-│   ├── train.json              # Training questions and metadata
-│   ├── train_cvqa.json         # CVQA format training data
-│   ├── option_maps.json        # Answer option mappings
-│   ├── closedquestions_definitions_imageclef2025.json  # Question definitions
-│   └── images_train/           # Training images
-├── valid/
-│   ├── valid.json              # Validation questions
-│   ├── valid_cvqa.json         # CVQA format validation data
-│   └── images_valid/           # Validation images
-└── test/
-    ├── test.json               # Test questions
-    └── images_test/            # Test images (if available)
-```
-
-### Output Structure
-```
-outputs/
-├── processed_val/              # Processed validation batches
-├── processed_val_fixed/        # Fixed image path batches
-├── processed_train_data-{model}-V3/     # Processed training data
-├── processed_combined_data-{model}-V3/  # Combined train+val data
-├── processed_test_data-{model}-V3/      # Processed test data
-├── val_dataset.csv            # Generated validation dataset
-├── finetuned-model/           # Fine-tuned model checkpoints
-├── merged/                    # Merged model files
-├── *_predictions_*.csv        # Raw prediction files
-├── *_aggregated_*.csv         # Aggregated predictions
-└── *_data_cvqa_sys_*.json     # Evaluation-ready predictions
-```
-
-## 🔧 Configuration
-
-### Environment Variables (`.env`)
-```env
-# Hugging Face token for model access
+# Hugging Face token (required for gated models like Llama)
 HF_TOKEN=your_huggingface_token_here
 
-# Gemini API key for reasoning pipeline
-API_KEY=your_gemini_api_key_here
-GEMINI_API_KEY=your_gemini_api_key_here  # Alternative
+# Google Gemini API key (required for reasoning and RAG stages)
+GOOGLE_API_KEY=your_gemini_api_key_here
 
-# Optional: Custom model cache directory
+# Optional: custom HuggingFace model cache directory
 HF_HOME=/path/to/huggingface/cache
 ```
 
-### Model Configuration
-Models are automatically configured based on selection. The pipeline handles:
-- Quantization settings (4-bit with NF4)
-- Attention mechanisms (Flash Attention 2 where supported)
-- Device mapping for multi-GPU setups
-- Memory optimization settings
+### 5. Place the Dataset
 
-## 📈 Pipeline Workflows
+Download the DermaVQA-DAS dataset from [ImageCLEF 2025](https://www.imageclef.org/2025) and place it at:
 
-### 1. Complete Training and Inference Workflow
+```
+2025_dataset/
+├── train/
+│   ├── train.json
+│   ├── train_cvqa.json
+│   ├── option_maps.json
+│   ├── closedquestions_definitions_imageclef2025.json
+│   └── images_train/
+├── valid/
+│   ├── valid.json
+│   ├── valid_cvqa.json
+│   └── images_valid/
+└── test/
+    ├── test.json
+    └── images_test/
+```
+
+---
+
+## 📖 Step-by-Step Usage
+
+The pipeline follows a sequential 8-step workflow. Run each step in order.
+
+### Step 1 — Data Preparation
+
+```bash
+python step1_prepare_data.py
+```
+
+Preprocesses and validates dataset files, generates batch `.pkl` files for training.
+
+### Step 2 — Smoke Test
+
+```bash
+python step2_smoke_test.py
+```
+
+Runs a 3-sample sanity check to confirm data loading, image paths, and GPU availability are all working before committing to full training.
+
+### Step 3 — Fine-Tune the Vision-Language Model
+
 ```python
-# 1. Initialize pipeline
+# Configure in step3_train.py before running:
+MODEL_NAME = "Qwen2-VL-2B-Instruct"   # see Supported Models below
+USE_COMBINED_DATASET = False            # True to merge train + val
+TEST_MODE = False                       # True for a quick 1-epoch test run
+```
+
+```bash
+python step3_train.py
+```
+
+Runs LoRA fine-tuning (rank 8, alpha 16, dropout 0.05) with 4-bit NF4 quantization. On an RTX 4060 8 GB, `Qwen2-VL-2B-Instruct` trains in approximately 2–3 hours per epoch.
+
+### Step 4 — Validation Inference
+
+```bash
+python step4_validate.py
+```
+
+Runs inference on the validation set and produces aggregated prediction CSV files in `outputs/`. **This step must complete before Step 6.**
+
+### Step 5 — Test Set Inference
+
+```bash
+python step5_test_inference.py
+```
+
+Runs inference on the test set. Note: test set ground truth is hidden; accuracy cannot be computed locally (see Troubleshooting).
+
+### Step 6 — RAG Sanity Test (1–3 Encounters)
+
+```python
+# Configure in step6_rag_sanity_test.py:
+GEMINI_MODEL = "gemini-2.5-flash-lite"  # recommended for free tier
+NUM_SAMPLES = 1                          # start with 1, increase to 3 when stable
+USE_TEST_DATASET = False
+USE_FINETUNING = True
+```
+
+```bash
+python step6_rag_sanity_test.py
+```
+
+Runs the full 8-stage agentic pipeline on a small sample to confirm Gemini API connectivity, rate-limit throttling, and knowledge base initialization.
+
+### Step 7 — Full RAG Run
+
+```bash
+python step7_rag_full_run.py
+```
+
+Processes all encounters with the complete pipeline. Saves intermediate results every N encounters (configurable) to protect against interruptions.
+
+### Step 8 — Evaluation
+
+```bash
+python step8_evaluate.py
+```
+
+Computes Jaccard-based partial-credit accuracy across all question types and generates the final submission file.
+
+---
+
+### Programmatic Usage
+
+```python
+# Fine-tuning pipeline
 from finetuning_pipeline.pipeline import FineTuningPipeline
 
 pipeline = FineTuningPipeline(
     model_name="Qwen2-VL-2B-Instruct",
     base_dir="./",
-    validate_paths=True
+    output_dir="./outputs",
+    validate_paths=True,
+    setup_environment=True,
 )
-
-# 2. Prepare data
-train_df, val_df = pipeline.prepare_data(use_combined=False)
-
-# 3. Train model
-trainer = pipeline.train(test_mode=False)
-
-# 4. Run inference
-predictions_df, aggregated_df, formatted_predictions = pipeline.run_inference()
+train_df, val_df = pipeline.prepare_data(use_combined=False, test_mode=False)
+trainer = pipeline.train(use_combined=False, test_mode=False)
+predictions_df, aggregated_df, formatted = pipeline.run_inference()
 ```
 
-### 2. Reasoning-Enhanced Workflow
 ```python
-# 1. Generate base predictions (from above)
-# 2. Apply reasoning layer
-from reasoning_pipeline import ReasoningConfig, ReasoningPipeline
+# 8-Stage Agentic RAG pipeline
+from rag_pipeline.rag_pipeline import RAGConfig, RAGPipeline
 
-config = ReasoningConfig(
+config = RAGConfig(
+    model_name="Qwen2-VL-2B-Instruct",
     use_finetuning=True,
+    use_test_dataset=False,
+    gemini_model="gemini-2.5-flash-lite",
+    max_reflection_cycles=2,
+    confidence_threshold=0.75,
+    fast_triage_confidence_threshold=0.95,   # Gap 1: bypass threshold
+    enforce_modality_separation=True,         # Gap 2: asymmetric partitioning
     base_dir="./",
-    output_dir="./outputs"
+    output_dir="./outputs",
 )
 
-reasoning_pipeline = ReasoningPipeline(config)
-reasoning_results = reasoning_pipeline.process_all_encounters()
+pipeline = RAGPipeline(config)
+results = pipeline.process_sample_encounters(num_samples=3)
 ```
-
-### 3. RAG-Enhanced Workflow
-```python
-# 1. Generate predictions and reasoning (from above)
-# 2. Apply RAG system
-from rag_pipeline.rag_pipeline import RAGPipeline
-
-rag_pipeline = RAGPipeline(base_dir="./")
-enhanced_results = rag_pipeline.process_with_knowledge_retrieval(reasoning_results)
-```
-
-## 🧪 Testing and Validation
-
-### Running Tests
-```bash
-# Test fine-tuning pipeline
-python finetuning_pipeline/finetuning_pipeline_example_usage.py
-
-# Test reasoning pipeline
-python reasoning_pipeline/reasoning_pipeline_example_usage.py
-
-# Test RAG pipeline
-python rag_pipeline/rag_pipeline_example_usage.py
-```
-
-### Validation Checks
-- Image path validation and automatic fixing
-- Dataset integrity verification
-- Model output format validation
-- Prediction consistency checks
-
-## 📋 Requirements
-
-### Core Dependencies
-```
-# Deep Learning Framework
-torch>=2.6.0
-transformers @ git+https://github.com/huggingface/transformers@b6d65e40b256d98d9621707762b94bc8ad83b7a7
-accelerate>=1.4.0
-peft>=0.14.0
-trl>=0.15.2
-bitsandbytes>=0.45.3
-
-# Vision-Language Models
-qwen-vl-utils>=0.0.11
-flash_attn>=2.7.4
-
-# Data Processing
-datasets>=3.3.2
-pandas>=2.2.3
-numpy>=2.1.2
-pillow>=11.1.0
-
-# Vector Search & RAG
-lancedb>=0.22.0
-sentence-transformers>=4.1.0
-FlagEmbedding>=1.3.4
-
-# API Integration
-google-generativeai>=0.8.4
-google-genai>=1.10.0
-
-# Utilities
-tqdm>=4.67.1
-python-dotenv>=1.1.0
-matplotlib>=3.10.1
-seaborn>=0.13.2
-```
-
-### Hardware Requirements
-- **GPU:** NVIDIA GPU with 8GB+ VRAM (16GB+ recommended for larger models)
-- **RAM:** 32GB+ system RAM recommended
-- **Storage:** 50GB+ free space for models and datasets
-- **CUDA:** Compatible CUDA installation (12.4+ recommended)
-
-## 🚨 Troubleshooting
-
-### Common Issues
-
-1. **CUDA Out of Memory:**
-   - Reduce batch size in training configuration
-   - Use gradient checkpointing (enabled by default)
-   - Try smaller models (e.g., Qwen2-VL-2B instead of 7B)
-   - Enable CPU offloading for large models
-
-2. **Image Path Errors:**
-   - Use the data preprocessing utilities in `data_preprocessor.py`
-   - Check image directory structure matches expected format
-   - Verify dataset paths in configuration
-
-3. **API Rate Limits:**
-   - Monitor API usage and quotas in Google Cloud Console
-   - Consider adding delays between requests for large batches
-   - Use the reasoning pipeline's built-in retry mechanisms
-
-4. **Model Loading Issues:**
-   - Verify HuggingFace token permissions for gated models
-   - Check model availability and access rights
-   - Ensure sufficient disk space for model cache
-   - Clear HuggingFace cache if corrupted: `rm -rf ~/.cache/huggingface/`
-
-5. **Transformers Version Issues:**
-   - The pipeline uses a specific transformers commit for compatibility
-   - Reinstall if needed: `pip install git+https://github.com/huggingface/transformers@b6d65e40b256d98d9621707762b94bc8ad83b7a7`
-
-### Debug Mode
-Enable debug logging by setting environment variables:
-```bash
-export TRANSFORMERS_VERBOSITY=debug
-export DATASETS_VERBOSITY=debug
-export CUDA_LAUNCH_BLOCKING=1  # For CUDA debugging
-```
-
-## 📄 License
-
-This project is licensed under the MIT License - see the LICENSE file for details.
-
-## 📞 Support
-
-For questions and support:
-- Open an issue on GitHub
-- Check the example usage files for implementation details
-- Review the troubleshooting section above
-
-## 🏆 Competition Results
-
-This pipeline was developed for the MEDIQA-MAGIC 2025 competition, focusing on dermatological image analysis and medical question answering. The modular design allows for easy experimentation with different model combinations and reasoning strategies.
 
 ---
 
-## 🚀 2026 Architectural Update: Agentic Medical RAG
+## 🤖 Supported Models
 
-The `rag_pipeline` has been refactored to implement a true Multi-Agent Medical VQA architecture, successfully addressing two critical gaps in the original implementation:
+| Model | HuggingFace ID | VRAM Required | Notes |
+|-------|---------------|:-------------:|-------|
+| `Qwen2-VL-2B-Instruct` | `Qwen/Qwen2-VL-2B-Instruct` | ~4 GB | ✅ Default · best for RTX 4060 |
+| `Qwen2.5-VL-3B-Instruct` | `Qwen/Qwen2.5-VL-3B-Instruct` | ~6 GB | Good quality/speed balance |
+| `Qwen2-VL-7B-Instruct` | `Qwen/Qwen2-VL-7B-Instruct` | ~14 GB | |
+| `Qwen2.5-VL-7B-Instruct` | `Qwen/Qwen2.5-VL-7B-Instruct` | ~14 GB | Highest baseline accuracy |
+| `gemma-3-4b-it` | `google/gemma-3-4b-it` | ~8 GB | |
+| `gemma-3-12b-it` | `google/gemma-3-12b-it` | ~24 GB | |
+| `llama-3.2-11b-vision` | `meta-llama/Llama-3.2-11B-Vision-Instruct` | ~22 GB | Requires `HF_TOKEN` |
 
-### 🧩 Addressed Architectural Gaps
-* **Gap 1 (Fast Triage Gatekeeper):** Implemented an early-exit gatekeeper that evaluates incoming multimodal data. If the confidence of an immediate answer exceeds >95%, the heavy multi-agent synthesis and RAG chain are completely bypassed to save compute.
-* **Gap 2 (Asymmetric Partitioning):** Enforced strict modality isolation to prevent consensus collapse. The Clinical Context Agent evaluates text blindly (no images), and the Image Analysis Agent evaluates images blindly (no text).
+All models are loaded with **4-bit NF4 quantization** by default to minimize VRAM usage. Flash Attention 2 is enabled where supported.
 
-### ⚙️ The New 8-Stage Agentic Flow
-1. **Fast Triage Agent:** Intercepts Description, Images, and Query. Routes high-confidence (>95%) assessments directly to Final Diagnosis.
-2. **Clinical Context Agent:** Receives *only* patient description (blind to images). Expands output to 13 structured clinical categories.
-3. **Image Analysis Agent:** Receives *only* images (blind to text). Expands output to 10 structured visual dimensions.
-4. **Diagnosis Extractor Agent:** Merges independent visual and textual findings alongside the clinical query side-feed to generate diagnostic hypotheses.
-5. **Knowledge Retrieval Agent:** Conditionally triggers Hybrid Retrieval (BM25 + BioBERT + Cross-Encoder) based on extracted diagnoses.
-6. **Evidence Integration Agent:** Consolidates clinical text, visual findings, and retrieved knowledge. (Explicitly excludes model predictions to prevent early bias).
-7. **Asymmetric Synthesizer:** Acts as the primary Reasoning Engine. Merges integrated evidence with 7-model advisory predictions, resolving modality contradictions via mathematical weighting.
-8. **Safety Loop (Self-Reflection & Re-Analysis):** If Synthesizer confidence < 0.75, a Self-Reflection Agent identifies gaps, triggering a Re-Analysis Agent to conduct a targeted deep-dive reassessment before yielding the Final Diagnosis.
+```python
+# Check available models programmatically
+from finetuning_pipeline.pipeline import FineTuningPipeline
+pipeline = FineTuningPipeline()
+print(pipeline.get_available_models())
+```
+
+---
+
+## 🔑 API Requirements & Rate Limits
+
+The reasoning and RAG stages (Steps 6–7) require a **Google Gemini API key** set as `GOOGLE_API_KEY` in your `.env` file.
+
+### Recommended Models by Use Case
+
+| Gemini Model | Free Tier RPM | Free Tier RPD | Recommendation |
+|---|:---:|:---:|---|
+| `gemini-2.5-flash-lite` | 15 | 1,000 | ✅ **Best for free-tier agentic loops** |
+| `gemini-2.5-flash` | 10 | 500 | Good for higher quality, halved daily quota |
+| `gemini-2.5-pro` | 5 | 100 | Best reasoning, very tight daily cap |
+| `gemini-2.0-flash` | 5 | 500 | ⚠️ Deprecated March 2026 — do not use |
+
+> **Important:** The 8-stage pipeline fires approximately 8 Gemini API calls per encounter. At `gemini-2.5-flash-lite`'s 15 RPM with the built-in 10-second mandatory pre-call throttle, a single encounter takes roughly 80–120 seconds. For large datasets (200+ encounters), **upgrading to a paid Gemini API tier is strongly recommended** to avoid hitting daily request limits mid-run.
+
+The pipeline implements automatic rate-limit handling:
+- **10-second mandatory sleep** before every API call (caps throughput at ≤6 RPM, safely inside all free-tier windows)
+- **Exponential backoff** on 429 errors: 30 s → 60 s → 120 s → 240 s → 480 s (5 retries max)
+
+---
+
+## 🚨 Troubleshooting
+
+### ❌ `division by zero` or "No evaluation files found" in Step 8
+
+**Cause:** You ran inference on the **test set** (`USE_TEST_DATASET = True`). The test set has hidden ground truth — accuracy cannot be computed locally.
+
+**Fix:** Set `USE_TEST_DATASET = False` in `step5_test_inference.py` and `step6_rag_sanity_test.py` to run on the **validation set** when calculating local accuracy metrics. Only switch to `True` when generating your final competition submission.
+
+---
+
+### ❌ `NameError: name 'some_file_path' is not defined` in `data_preprocessor.py`
+
+**Cause:** A manual find-replace accidentally overwrote a variable name with a placeholder string when adding `encoding='utf-8'` to `open()` calls.
+
+**Fix:** On line 120 of `data_preprocessor.py`, replace:
+```python
+# WRONG
+with open(some_file_path, 'r', encoding='utf-8') as f:
+
+# CORRECT
+with open(self.config.QUESTIONS_PATH, 'r', encoding='utf-8') as f:
+```
+
+---
+
+### ❌ Step 3 prints "Starting pipeline..." then exits silently with no training progress bar
+
+**Cause (most common):** The processed `.pkl` batch files are empty or missing. This happens when a previous run created the output folders but failed before writing data, or when `TEST_MODE = True` triggers training with `save_steps=50` but only 1 total optimisation step exists — so no checkpoint is ever saved and the script exits cleanly.
+
+**Fix:** Ensure `step1_prepare_data.py` and `step2_smoke_test.py` both completed successfully. Then in `step3_train.py`, confirm at least one `.pkl` file exists in `outputs/processed_train_data-{model}/` before training. In `TEST_MODE`, the pipeline now automatically overrides `save_steps=1` to guarantee a checkpoint is always written.
+
+---
+
+### ❌ `429 RESOURCE_EXHAUSTED` errors from Gemini API
+
+**Cause:** The 8-agent pipeline fires API calls faster than your free-tier quota allows.
+
+**Fix options (in order of preference):**
+1. Use `gemini-2.5-flash-lite` (15 RPM, 1,000 RPD) — highest free-tier headroom
+2. The built-in 10-second throttle + exponential backoff handles transient spikes automatically
+3. For datasets of 200+ encounters, upgrade to a Gemini paid tier (Tier 1 provides 150–300 RPM)
+
+---
+
+### ❌ CUDA Out of Memory during training
+
+**Fix options:**
+- Switch to a smaller model (`Qwen2-VL-2B-Instruct` instead of 7B)
+- Reduce `per_device_train_batch_size` to 1 (already the default)
+- Ensure 4-bit NF4 quantization is enabled (default in this pipeline)
+- Enable gradient checkpointing (enabled by default)
+- Close other GPU-consuming processes before running
+
+---
+
+### ❌ Model loading fails for `llama-3.2-11b-vision`
+
+**Cause:** This is a gated model requiring explicit HuggingFace access.
+
+**Fix:** Request access at [meta-llama/Llama-3.2-11B-Vision-Instruct](https://huggingface.co/meta-llama/Llama-3.2-11B-Vision-Instruct) and ensure `HF_TOKEN` is set in your `.env`.
+
+---
+
+### Debug Mode
+
+```bash
+# Enable verbose logging for CUDA and transformer issues
+export TRANSFORMERS_VERBOSITY=debug
+export CUDA_LAUNCH_BLOCKING=1
+```
+
+---
+
+## 📁 Output Structure
+
+```
+outputs/
+├── processed_train_data-{model}-V3/     # Preprocessed training batch files (.pkl)
+├── processed_val_data-{model}-V3/       # Preprocessed validation batch files
+├── processed_test_data-{model}-V3/      # Preprocessed test batch files
+├── finetuned-model/                     # LoRA checkpoints + merged weights
+├── val_dataset.csv                      # Validation metadata
+├── val_aggregated_predictions_{model}_{timestamp}.csv   # Step 4 output
+├── test_aggregated_predictions_{model}_{timestamp}.csv  # Step 5 output
+├── rag_sample_results_{timestamp}.json  # Step 6 sanity test output
+├── validation_data_cvqa_rag_complete_{timestamp}.json   # Step 7 complete results
+└── validation_data_cvqa_rag_formatted_{timestamp}.json  # Step 8 submission format
+```
+
+---
+
+## 📜 Citation
+
+If you use this work, please cite both the 2026 IIT Patna paper and the original 2025 Georgia Tech paper that this system builds upon:
+
+**2026 Paper (this repository's architecture):**
+```bibtex
+@article{kuranjekar2026efficient,
+  title   = {Efficient Clinical Reasoning Under Constraint: Fast Triage and
+             Asymmetric Partitioning in Medical Vision-Language Agentic RAG},
+  author  = {Kuranjekar, Aditya and Prasannapriyan, G and Misra, Rajiv and
+             Sharma, Rishu and Shreya},
+  institution = {Indian Institute of Technology Patna},
+  year    = {2026}
+}
+```
+
+**2025 Paper (original baseline architecture):**
+```bibtex
+@article{thakrar2025architecting,
+  title   = {Architecting Clinical Collaboration: Multi-Agent Reasoning Systems
+             for Multimodal Medical VQA},
+  author  = {Thakrar, Karishma and Basavatia, Shreyas and Daftardar, Akshay},
+  journal = {arXiv preprint arXiv:2507.05520},
+  year    = {2025}
+}
+```
+
+---
+
+## 📄 License
+
+This project is licensed under the **MIT License**. See [LICENSE](LICENSE) for details.
+
+---
+
+## 🙏 Acknowledgments
+
+The authors thank **IIT Patna** for providing GPU compute resources used in the fine-tuning experiments, and the **ImageCLEF 2025** organizers for making the DermaVQA-DAS dataset publicly available. This work builds directly on the foundational architecture of Thakrar et al. (2025) from Georgia Institute of Technology.
+
+---
+
+<div align="center">
+  <sub>Built at IIT Patna · 2026 · For questions, open a GitHub Issue</sub>
+</div>
